@@ -174,7 +174,7 @@ func main() {
 	flag.StringVar(&operatorImagePullPolicy, "operator-image-pull-policy", string(corev1.PullIfNotPresent),
 		"Image pull policy for operator helper init containers")
 	flag.StringVar(&dgdrDefaultImage, "dgdr-default-image", "",
-		"Default DGDR profiler image, put into DGDR spec.image when unset; empty derives dynamo-planner:<operator-version>")
+		"Planner image used by v1beta2 Runs and as the v1beta1 spec.image default; empty derives dynamo-planner:<operator-version>")
 	flag.BoolVar(&dgdrV1beta2Enabled, "dgdr-v1beta2-enabled", false,
 		"Reconcile native v1beta2 DGDRs; requires the v1beta2 Request and Run CRDs to be installed")
 	opts := zap.Options{
@@ -499,10 +499,11 @@ func main() {
 
 	// Register controllers synchronously before mgr.Start().
 	// Controllers don't depend on TLS certificates.
+	plannerImage := webhookdefaulting.PlannerImageFor(operatorVersion, dgdrDefaultImage)
 	if err := registerControllers(
 		mgr, operatorCfg, runtimeConfig,
 		dockerSecretRetriever, sshKeyManager,
-		operatorImage, pullPolicy,
+		operatorImage, pullPolicy, plannerImage,
 		dgdrV1beta2Enabled,
 	); err != nil {
 		setupLog.Error(err, "failed to register controllers")
@@ -553,6 +554,7 @@ func registerControllers(
 	sshKeyManager *secret.SSHKeyManager,
 	operatorImage string,
 	operatorPullPolicy corev1.PullPolicy,
+	plannerImage string,
 	dgdrV1beta2Enabled bool,
 ) error {
 	if operatorCfg.Namespace.Restricted == "" {
@@ -624,6 +626,7 @@ func registerControllers(
 		}
 		if err := controller.SetupDynamoGraphDeploymentRunV1beta2(mgr, controller.DynamoGraphDeploymentRunSetupOptions{
 			SetupOptions:            setupOptions,
+			PlannerImage:            plannerImage,
 			OperatorImage:           operatorImage,
 			OperatorImagePullPolicy: operatorPullPolicy,
 		}); err != nil {

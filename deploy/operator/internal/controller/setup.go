@@ -49,6 +49,7 @@ type DynamoGraphDeploymentRunSetupOptions struct {
 	SetupOptions
 	GPUDiscoveryCache       *gpu.GPUDiscoveryCache
 	GPUDiscovery            *gpu.GPUDiscovery
+	PlannerImage            string
 	OperatorImage           string
 	OperatorImagePullPolicy corev1.PullPolicy
 }
@@ -187,6 +188,7 @@ func SetupDynamoGraphDeploymentRunV1beta2(mgr ctrl.Manager, opts DynamoGraphDepl
 				return opts.RuntimeConfig != nil && opts.RuntimeConfig.Gate.Enabled(features.GPUDiscovery)
 			},
 		},
+		PlannerImage:            opts.PlannerImage,
 		OperatorImage:           opts.OperatorImage,
 		OperatorImagePullPolicy: opts.OperatorImagePullPolicy,
 	}).SetupWithManager(mgr); err != nil {
