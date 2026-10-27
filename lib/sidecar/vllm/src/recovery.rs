@@ -256,17 +256,19 @@ impl VllmSidecarEngine {
         let ranks = state.ranks.lock().clone();
         let result = timeout_at(deadline, async {
             let gate = try_join_all(ranks.into_iter().map(Self::wait_for_rank));
-            tokio::select! {
+            let gate = tokio::select! {
                 biased;
-                error = unhealthy(state.health.clone()) => Err(error),
+                error = unhealthy(state.health.clone()) => return Err(error),
                 result = gate => result.map(|_| ()),
-            }?;
+            };
+            // Check identity even when a rank failed: the failure may belong to a replaced engine.
             let (_, server) = state.client.discover(deadline).await?;
             let is_replaced = server.instance_id != state.model.instance_id();
             if is_replaced {
                 // This connection now reaches another engine; only a reconnect can recover.
                 state.cancel.cancel();
             }
+            gate?;
             if is_replaced || *state.health.borrow() != EngineHealth::Serving {
                 return Err(client::engine_shutdown(
                     "vLLM engine changed or became unhealthy during KV recovery",
@@ -372,8 +374,8 @@ impl VllmSidecarEngine {
                 EngineHealth::Serving
             }
         };
-        // Stop admitting requests; in-flight requests and KV ingestion continue
-        // unless the connection itself was lost.
+        // Stop admitting requests. KV ingestion continues, and so do in-flight
+        // requests unless the connection itself was lost.
         self.state.is_recovering.store(true, Ordering::Release);
         if health == EngineHealth::Lost {
             state.cancel.cancel();
