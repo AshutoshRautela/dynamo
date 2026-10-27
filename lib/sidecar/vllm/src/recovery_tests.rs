@@ -3,8 +3,8 @@
 
 use super::*;
 use dynamo_backend_common::{EngineRecovery, KvEventSource};
-use dynamo_llm::kv_router::publisher::{KvStreamStatus, ZmqRecoveryConfig};
-use tokio::time::{Duration, timeout};
+use dynamo_llm::kv_router::publisher::{KvStreamCommand, KvStreamStatus, ZmqRecoveryConfig};
+use tokio::time::{Duration, Instant, timeout};
 
 async fn started(server: &FakeServer) -> (Arc<VllmSidecarEngine>, Vec<ZmqRecoveryConfig>) {
     let engine = Arc::new(engine(
@@ -31,6 +31,21 @@ async fn started(server: &FakeServer) -> (Arc<VllmSidecarEngine>, Vec<ZmqRecover
         })
         .collect();
     (engine, controls)
+}
+
+/// Ends both Health.Watch streams, as a lost engine connection would, or restores serving.
+async fn set_health(server: &mut FakeServer, is_serving: bool) {
+    for service in [CONTROL_SERVICE, INFERENCE_SERVICE] {
+        if !is_serving {
+            server.health.clear_service_status(service).await;
+        }
+        let status = if is_serving {
+            HealthServingStatus::Serving
+        } else {
+            HealthServingStatus::NotServing
+        };
+        server.health.set_service_status(service, status).await;
+    }
 }
 
 #[tokio::test]
@@ -68,11 +83,14 @@ async fn missing_history_requests_shutdown_and_accepts_replacement_without_ackno
         });
     controls[1].status.send_replace(KvStreamStatus::Success);
     assert!(engine.wait_for_startup().await.is_err());
-    let config = timeout(Duration::from_secs(5), engine.recover_startup())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let Some(EngineRecovery::Replacement(config)) =
+        timeout(Duration::from_secs(5), engine.recover_startup())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected a replacement engine")
+    };
     assert_eq!(config.model, "model-source");
     assert_eq!(
         server
@@ -154,6 +172,106 @@ async fn failed_recovery_does_not_shutdown_and_unmanaged_engine_failure_is_expli
 }
 
 #[tokio::test]
+async fn health_loss_keeps_kv_recovery_running_for_the_same_engine() {
+    let mut server = FakeServer::start(FakeVllm::default()).await;
+    let (engine, mut controls) = started(&server).await;
+    set_health(&mut server, false).await;
+    assert!(engine.wait_for_startup().await.is_err());
+    set_health(&mut server, true).await;
+    for control in &controls {
+        control.status.send_replace(KvStreamStatus::Success);
+    }
+    assert!(matches!(
+        timeout(Duration::from_secs(10), engine.recover_startup())
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(EngineRecovery::SameInstance)
+    ));
+    set_health(&mut server, false).await;
+    timeout(Duration::from_secs(2), engine.wait_for_unavailable())
+        .await
+        .unwrap()
+        .unwrap();
+    set_health(&mut server, true).await;
+    assert!(matches!(
+        timeout(Duration::from_secs(10), engine.recover_serving())
+            .await
+            .unwrap()
+            .unwrap(),
+        EngineRecovery::SameInstance
+    ));
+    // KV listeners were neither paused nor reconnected.
+    for control in &mut controls {
+        assert!(control.commands.try_recv().is_err());
+    }
+    engine.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_replay_restarts_only_after_the_same_engine_is_verified() {
+    let failed = || KvStreamStatus::Failed {
+        reason: "KV recovery round exhausted".into(),
+    };
+    // With health verified, failed replay is final.
+    let server = FakeServer::start(FakeVllm::default()).await;
+    let (engine, mut controls) = started(&server).await;
+    controls[0].status.send_replace(failed());
+    assert!(engine.wait_for_startup().await.is_err());
+    assert!(engine.recover_startup().await.is_err());
+    assert!(controls[0].commands.try_recv().is_err());
+    engine.cleanup().await.unwrap();
+    // While health is lost it waits; the same engine then restarts replay, unless the listener refuses.
+    for is_refused in [false, true] {
+        let mut server = FakeServer::start(FakeVllm::default()).await;
+        let (engine, mut controls) = started(&server).await;
+        set_health(&mut server, false).await;
+        assert!(engine.wait_for_startup().await.is_err());
+        controls[0].status.send_replace(failed());
+        let recovered = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.recover_startup().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!recovered.is_finished());
+        set_health(&mut server, true).await;
+        let Some(KvStreamCommand::Restart { deadline, accepted }) =
+            timeout(Duration::from_secs(10), controls[0].commands.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("expected a restart")
+        };
+        assert!(deadline > Instant::now());
+        assert!(controls[1].commands.try_recv().is_err());
+        if is_refused {
+            drop(accepted);
+            assert!(
+                timeout(Duration::from_secs(5), recovered)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+        } else {
+            for control in &controls {
+                control.status.send_replace(KvStreamStatus::Success);
+            }
+            accepted.send(()).unwrap();
+            assert!(matches!(
+                timeout(Duration::from_secs(5), recovered)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                Some(EngineRecovery::SameInstance)
+            ));
+        }
+        engine.cleanup().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn changed_instance_fails_startup_and_recovers_as_replacement() {
     let server = FakeServer::start(FakeVllm::default()).await;
     let (engine, controls) = started(&server).await;
@@ -168,11 +286,14 @@ async fn changed_instance_fails_startup_and_recovers_as_replacement() {
         .get_or_insert_with(server_info)
         .instance_id = "replacement-instance".into();
     assert!(engine.wait_for_startup().await.is_err());
-    let config = timeout(Duration::from_secs(5), engine.recover_startup())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let Some(EngineRecovery::Replacement(config)) =
+        timeout(Duration::from_secs(5), engine.recover_startup())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected a replacement engine")
+    };
     assert_eq!(config.model, "model-source");
     assert!(server.service.control_calls.lock().await.is_empty());
     engine.cleanup().await.unwrap();
@@ -237,7 +358,7 @@ async fn paused_engine_keeps_in_flight_requests_and_kv_ingestion() {
             .unwrap(),
         EngineRecovery::SameInstance
     ));
-    // Neither Suspend nor a reconnect interrupted KV ingestion.
+    // No command paused or reconnected KV ingestion.
     for control in &mut controls {
         assert!(control.commands.try_recv().is_err());
     }

@@ -61,6 +61,11 @@ impl VllmSidecarEngine {
             .ok_or_else(|| client::engine_shutdown("vLLM sidecar is not started"))
     }
 
+    /// Starts the startup budget before metadata bootstrap; registration clears it.
+    pub(super) fn start_deadline(&self, deadline: Instant) {
+        *self.state.deadline.lock() = Some(deadline);
+    }
+
     fn recovery_deadline(&self) -> Result<Instant, DynamoError> {
         let mut deadline = self.state.deadline.lock();
         if let Some(deadline) = *deadline {
@@ -229,7 +234,7 @@ impl VllmSidecarEngine {
                 recovery: Some(ZmqRecoveryConfig {
                     replay_endpoint: zmq_connect_endpoint(&source.replay_endpoint, &self.endpoint),
                     dp_rank: rank,
-                    timeout: deadline.saturating_duration_since(Instant::now()),
+                    deadline,
                     status: status_tx,
                     commands: command_rx,
                 }),
@@ -257,9 +262,12 @@ impl VllmSidecarEngine {
                 result = gate => result.map(|_| ()),
             }?;
             let (_, server) = state.client.discover(deadline).await?;
-            if server.instance_id != state.model.instance_id()
-                || *state.health.borrow() != EngineHealth::Serving
-            {
+            let is_replaced = server.instance_id != state.model.instance_id();
+            if is_replaced {
+                // This connection now reaches another engine; only a reconnect can recover.
+                state.cancel.cancel();
+            }
+            if is_replaced || *state.health.borrow() != EngineHealth::Serving {
                 return Err(client::engine_shutdown(
                     "vLLM engine changed or became unhealthy during KV recovery",
                 ));
@@ -273,7 +281,6 @@ impl VllmSidecarEngine {
             )
         })?;
         if result.is_ok() && self.runtime_endpoint.get().is_none() {
-            *self.state.deadline.lock() = None;
             self.state.is_recovering.store(false, Ordering::Release);
         }
         result
@@ -370,9 +377,6 @@ impl VllmSidecarEngine {
         self.state.is_recovering.store(true, Ordering::Release);
         if health == EngineHealth::Lost {
             state.cancel.cancel();
-            for rank in state.ranks.lock().clone() {
-                let _ = rank.commands.try_send(KvStreamCommand::Suspend);
-            }
         }
         Ok(())
     }
@@ -393,7 +397,8 @@ impl VllmSidecarEngine {
                 Ok(()) => return Ok(()),
                 Err(error) => error,
             };
-            let is_retryable = *state.health.borrow() != EngineHealth::Lost
+            let is_retryable = !state.cancel.is_cancelled()
+                && *state.health.borrow() != EngineHealth::Lost
                 && Instant::now() < deadline
                 && !state.ranks.lock().iter().any(|rank| {
                     matches!(
@@ -409,11 +414,11 @@ impl VllmSidecarEngine {
         }
     }
 
-    pub(super) async fn reconnect(&self, is_startup: bool) -> Result<EngineRecovery, DynamoError> {
+    pub(super) async fn reconnect(&self) -> Result<EngineRecovery, DynamoError> {
         self.state.is_recovering.store(true, Ordering::Release);
         let old = self.started_state()?;
         let deadline = self.recovery_deadline()?;
-        if !is_startup && *old.health.borrow() != EngineHealth::Lost {
+        if *old.health.borrow() != EngineHealth::Lost {
             match self.recover_in_place(&old, deadline).await {
                 Ok(()) => return Ok(EngineRecovery::SameInstance),
                 Err(error) => {
@@ -421,40 +426,26 @@ impl VllmSidecarEngine {
                 }
             }
         }
-        if is_startup {
-            // A failed startup gate retries with fresh publishers; pace the attempts.
-            tokio::time::sleep(self.transport.retry_interval).await;
-        }
-        old.cancel.cancel();
         let ranks = old.ranks.lock().clone();
-        for rank in &ranks {
-            let _ = rank.commands.try_send(KvStreamCommand::Suspend);
-        }
-        if ranks
-            .iter()
-            .any(|rank| matches!(*rank.status.borrow(), KvStreamStatus::Failed { .. }))
-        {
+        if is_failure_final(&old, &ranks) {
             return Err(client::protocol_error(
                 "KV recovery failed; engine shutdown is not justified",
             ));
         }
-        timeout_at(
-            deadline,
-            self.replace_connection(&old, ranks, is_startup, deadline),
-        )
-        .await
-        .map_err(|_| {
-            client::engine_shutdown(
-                "vLLM recovery deadline exceeded while waiting for an engine replacement",
-            )
-        })?
+        old.cancel.cancel();
+        timeout_at(deadline, self.replace_connection(&old, ranks, deadline))
+            .await
+            .map_err(|_| {
+                client::engine_shutdown(
+                    "vLLM recovery deadline exceeded while waiting for an engine replacement",
+                )
+            })?
     }
 
     async fn replace_connection(
         &self,
         old: &Connection,
         ranks: Vec<RankRecovery>,
-        is_startup: bool,
         deadline: Instant,
     ) -> Result<EngineRecovery, DynamoError> {
         let has_missing_history = |ranks: &[RankRecovery]| {
@@ -479,31 +470,28 @@ impl VllmSidecarEngine {
                 continue;
             }
             tracing::info!(instance_id = %connection.model.instance_id(), is_replacement = !is_same, "Reconnected to vLLM engine");
-            if is_same && !is_startup {
+            if is_same {
                 *connection.ranks.lock() = ranks.clone();
                 for rank in &ranks {
-                    reconnect_rank(rank).await?;
+                    if matches!(*rank.status.borrow(), KvStreamStatus::Failed { .. }) {
+                        restart_rank(rank, deadline).await?;
+                    }
                 }
             }
             let config = self.engine_config(&connection.model)?;
             *self.state.current.lock() = Some(connection);
-            if !is_same || is_startup {
+            if !is_same {
                 return Ok(EngineRecovery::Replacement(Box::new(config)));
             }
             let error = match self.wait_for_recovery().await {
                 Ok(()) => return Ok(EngineRecovery::SameInstance),
                 Err(error) => error,
             };
-            self.started_state()?.cancel.cancel();
-            if ranks
-                .iter()
-                .any(|rank| matches!(*rank.status.borrow(), KvStreamStatus::Failed { .. }))
-            {
+            let state = self.started_state()?;
+            if is_failure_final(&state, &ranks) {
                 return Err(error);
             }
-            for rank in &ranks {
-                let _ = rank.commands.try_send(KvStreamCommand::Suspend);
-            }
+            state.cancel.cancel();
             tracing::warn!(%error, "vLLM recovery remains incomplete");
             tokio::time::sleep(self.transport.retry_interval).await;
         }
@@ -541,15 +529,29 @@ impl VllmSidecarEngine {
     }
 }
 
-async fn reconnect_rank(rank: &RankRecovery) -> Result<(), DynamoError> {
+/// Failed replay is final while the engine's health is verified on this connection.
+fn is_failure_final(state: &Connection, ranks: &[RankRecovery]) -> bool {
+    !state.cancel.is_cancelled()
+        && *state.health.borrow() != EngineHealth::Lost
+        && ranks
+            .iter()
+            .any(|rank| matches!(*rank.status.borrow(), KvStreamStatus::Failed { .. }))
+}
+
+/// Restarts replay that ran out of transport retries; a final failure refuses.
+async fn restart_rank(rank: &RankRecovery, deadline: Instant) -> Result<(), DynamoError> {
     let (accepted, response) = oneshot::channel();
+    let refused = || {
+        client::protocol_error(format!(
+            "rank {} KV recovery failed; engine shutdown is not justified",
+            rank.rank
+        ))
+    };
     rank.commands
-        .send(KvStreamCommand::Resume(accepted))
+        .send(KvStreamCommand::Restart { deadline, accepted })
         .await
-        .map_err(|_| client::engine_shutdown("KV listener ended; retained state cannot resume"))?;
-    response
-        .await
-        .map_err(|_| client::engine_shutdown("KV listener ended before reconnect"))
+        .map_err(|_| refused())?;
+    response.await.map_err(|_| refused())
 }
 
 async fn serving(mut health: watch::Receiver<EngineHealth>) -> Result<(), DynamoError> {
