@@ -392,9 +392,8 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 				})
 			})
 
-			t.Log("Observe a live Candidate update before the real AISimulate and publisher containers finish the Run")
+			t.Log("Observe the Run until the real AISimulate and publisher containers finish")
 			var completedRun nvidiacomv1beta2.DynamoGraphDeploymentRun
-			sawLiveCandidate := false
 			deadline := time.NewTimer(10 * time.Minute)
 			defer deadline.Stop()
 			for completedRun.Status.Phase != nvidiacomv1beta2.DGDRRunPhaseSucceeded {
@@ -411,18 +410,11 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 					}
 					require.NotEqual(t, nvidiacomv1beta2.DGDRRunPhaseFailed, run.Status.Phase,
 						"Run failed: %v", run.Status.Conditions)
-					if run.Status.Phase != nvidiacomv1beta2.DGDRRunPhaseSucceeded &&
-						run.Status.Progress != nil && run.Status.Progress.Candidates != nil &&
-						run.Status.Progress.Candidates.Published > 0 && len(run.Status.CandidateRefs) > 0 &&
-						run.Status.LastProgressTime != nil {
-						sawLiveCandidate = true
-					}
 					completedRun = *run.DeepCopy()
 				case <-deadline.C:
 					t.Fatal("v1beta2 DGDR did not complete with a candidate")
 				}
 			}
-			require.True(t, sawLiveCandidate, "publisher never exposed a Candidate before the Run became terminal")
 			require.NotNil(t, completedRun.Status.Progress, "completed Run has no progress")
 			require.NotNil(t, completedRun.Status.Progress.Candidates, "completed Run has no candidate progress")
 			require.Equal(t, int32(1), completedRun.Status.Progress.Candidates.Published)

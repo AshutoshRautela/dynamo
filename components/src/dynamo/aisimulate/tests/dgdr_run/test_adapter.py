@@ -805,7 +805,13 @@ def test_pinned_aisimulate_dispatches_the_complete_lifecycle_to_dgdr_run(
             "optimizer": {"parallelism": 1, "max_trials": 1},
         }
     )
-    output_config = {**PLUGIN_CONFIG, "snapshot_dir": str(tmp_path)}
+    output_config = {
+        **PLUGIN_CONFIG,
+        "snapshot_dir": str(tmp_path),
+        # Keep candidate and round updates buffered so their presence after a
+        # successful search proves that on_complete forced the final live flush.
+        "snapshot_interval_seconds": 3600,
+    }
     result = _final_result(1)
     search_error = RuntimeError("search crashed")
 
