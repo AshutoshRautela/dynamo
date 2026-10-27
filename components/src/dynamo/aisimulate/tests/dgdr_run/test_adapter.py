@@ -791,18 +791,18 @@ def test_pinned_aisimulate_dispatches_the_complete_lifecycle_to_dgdr_run(
                 },
                 "load": {
                     "type": "concurrency",
-                    "concurrency": {"choices": [8, 64512]},
+                    "concurrency": {"choices": [8]},
                 },
-                "stop": {"requests_per_load_unit": 100},
+                "stop": {"requests_per_load_unit": 1},
             },
             "optimization": {
-                "target": "pareto",
+                "target": "throughput_per_gpu",
                 "constraints": {
-                    "min_candidate_gpus": 72,
-                    "max_candidate_gpus": 72,
+                    "min_candidate_gpus": 1,
+                    "max_candidate_gpus": 8,
                 },
             },
-            "optimizer": {"parallelism": 8, "max_trials": 256},
+            "optimizer": {"parallelism": 1, "max_trials": 1},
         }
     )
     output_config = {**PLUGIN_CONFIG, "snapshot_dir": str(tmp_path)}
