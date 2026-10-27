@@ -629,6 +629,7 @@ func registerControllers(
 		}
 		if err := controller.SetupDynamoGraphDeploymentRunV1beta2(mgr, controller.DynamoGraphDeploymentRunSetupOptions{
 			SetupOptions:            setupOptions,
+			DockerSecretRetriever:   dockerSecretRetriever,
 			PlannerImage:            plannerImage,
 			DynamoVersion:           dynamoVersion,
 			OperatorImage:           operatorImage,
