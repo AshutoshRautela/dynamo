@@ -37,6 +37,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -357,6 +358,13 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 				t.Fatalf("get admitted v1beta2 DGDR: %v", err)
 			}
 
+			t.Log("Watch every Run transition before starting the production controllers")
+			watchClient, err := client.NewWithWatch(env.RESTConfig(), client.Options{Scheme: newClusterTestScheme()})
+			require.NoError(t, err)
+			runWatch, err := watchClient.Watch(ctx, &nvidiacomv1beta2.DynamoGraphDeploymentRunList{}, client.InNamespace(env.Namespace()))
+			require.NoError(t, err)
+			defer runWatch.Stop()
+
 			t.Log("Provide the Run controller the discovered node shape represented by the explicit Request hardware")
 			hardwareCache := gpu.NewGPUDiscoveryCache()
 			hardwareCache.Set(nvidiacomv1beta1.GPUSKUTypeH200SXM, &gpu.GPUInfo{
@@ -384,30 +392,41 @@ func TestClusterDynamoGraphDeploymentRequestV1beta2ProducesCandidates(t *testing
 				})
 			})
 
-			t.Log("Wait for the real AISimulate and publisher containers to finish the Run")
+			t.Log("Observe a live Candidate update before the real AISimulate and publisher containers finish the Run")
 			var completedRun nvidiacomv1beta2.DynamoGraphDeploymentRun
-			dynamotesting.Eventually(t, func() (bool, string) {
-				var runs nvidiacomv1beta2.DynamoGraphDeploymentRunList
-				require.NoError(t, env.Client().List(ctx, &runs, client.InNamespace(env.Namespace())))
-				if len(runs.Items) == 0 {
-					return false, "the Request has not created a Run"
+			sawLiveCandidate := false
+			deadline := time.NewTimer(10 * time.Minute)
+			defer deadline.Stop()
+			for completedRun.Status.Phase != nvidiacomv1beta2.DGDRRunPhaseSucceeded {
+				select {
+				case event, ok := <-runWatch.ResultChan():
+					require.True(t, ok, "Run watch closed before the execution completed")
+					if event.Type == watch.Error {
+						t.Fatalf("Run watch failed: %v", apierrors.FromObject(event.Object))
+					}
+					run, ok := event.Object.(*nvidiacomv1beta2.DynamoGraphDeploymentRun)
+					require.Truef(t, ok, "Run watch returned %T", event.Object)
+					if !metav1.IsControlledBy(run, request) {
+						continue
+					}
+					require.NotEqual(t, nvidiacomv1beta2.DGDRRunPhaseFailed, run.Status.Phase,
+						"Run failed: %v", run.Status.Conditions)
+					if run.Status.Phase != nvidiacomv1beta2.DGDRRunPhaseSucceeded &&
+						run.Status.Progress != nil && run.Status.Progress.Candidates != nil &&
+						run.Status.Progress.Candidates.Published > 0 && len(run.Status.CandidateRefs) > 0 &&
+						run.Status.LastProgressTime != nil {
+						sawLiveCandidate = true
+					}
+					completedRun = *run.DeepCopy()
+				case <-deadline.C:
+					t.Fatal("v1beta2 DGDR did not complete with a candidate")
 				}
-				require.Len(t, runs.Items, 1, "one Request generation must create exactly one Run")
-				completedRun = runs.Items[0]
-				require.NotEqual(t, nvidiacomv1beta2.DGDRRunPhaseFailed, completedRun.Status.Phase,
-					"Run failed: %v", completedRun.Status.Conditions)
-				if completedRun.Status.Phase != nvidiacomv1beta2.DGDRRunPhaseSucceeded {
-					return false, fmt.Sprintf("Run phase is %s", completedRun.Status.Phase)
-				}
-				if completedRun.Status.Progress == nil || completedRun.Status.Progress.Candidates == nil {
-					return false, "the publisher has not reported candidate progress"
-				}
-				if completedRun.Status.Progress.Candidates.Published != 1 || len(completedRun.Status.CandidateRefs) != 1 {
-					return false, fmt.Sprintf("the publisher reports %d candidates and %d references",
-						completedRun.Status.Progress.Candidates.Published, len(completedRun.Status.CandidateRefs))
-				}
-				return true, "Run succeeded with one published candidate"
-			}, 10*time.Minute, time.Second, "v1beta2 DGDR did not complete with a candidate")
+			}
+			require.True(t, sawLiveCandidate, "publisher never exposed a Candidate before the Run became terminal")
+			require.NotNil(t, completedRun.Status.Progress, "completed Run has no progress")
+			require.NotNil(t, completedRun.Status.Progress.Candidates, "completed Run has no candidate progress")
+			require.Equal(t, int32(1), completedRun.Status.Progress.Candidates.Published)
+			require.Len(t, completedRun.Status.CandidateRefs, 1)
 
 			t.Log("Verify the Candidate is a real API object controlled by the immutable Run")
 			require.True(t, metav1.IsControlledBy(&completedRun, request), "Run is not controlled by its Request")

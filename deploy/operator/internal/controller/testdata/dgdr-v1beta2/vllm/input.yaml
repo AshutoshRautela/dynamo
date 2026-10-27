@@ -37,8 +37,10 @@ spec:
           requests: 8
       optimizer:
         algorithm: random
-        max_trials: 1
+        max_trials: 3
         parallelism: 1
         candidate_timeout_seconds: 120
+      dgdr_run:
+        snapshot_interval_seconds: 0
   recommendation:
     maxCandidates: 1
