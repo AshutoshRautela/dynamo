@@ -267,6 +267,7 @@ async fn failed_replay_restarts_only_after_the_same_engine_is_verified() {
                 Some(EngineRecovery::SameInstance)
             ));
         }
+        assert!(server.service.control_calls.lock().await.is_empty());
         engine.cleanup().await.unwrap();
     }
 }
