@@ -211,9 +211,11 @@ async fn failed_replay_restarts_only_after_the_same_engine_is_verified() {
 async fn changed_instance_fails_startup_and_recovers_as_replacement() {
     let server = FakeServer::start(FakeVllm::default()).await;
     let (engine, controls) = started(&server).await;
-    for control in &controls {
-        control.status.send_replace(KvStreamStatus::Success);
-    }
+    // Replay that ran out against the old engine must not block the replacement.
+    controls[0].status.send_replace(KvStreamStatus::Failed {
+        reason: "KV recovery round exhausted".into(),
+    });
+    controls[1].status.send_replace(KvStreamStatus::Success);
     server
         .service
         .server_info_override
