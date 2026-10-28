@@ -697,7 +697,6 @@ func hasMountAt(mounts []corev1.VolumeMount, name, path string) bool {
 	return false
 }
 
-// dgdrRunWithTraceForTest is dgdrRunForTest replaying one file of the request-traces claim.
 func dgdrRunWithTraceForTest(t *testing.T, inputOverrides map[string]any) *nvidiacomv1beta2.DynamoGraphDeploymentRun {
 	t.Helper()
 	run := dgdrRunForTest(t, inputOverrides)
@@ -710,7 +709,6 @@ func dgdrRunWithTraceForTest(t *testing.T, inputOverrides map[string]any) *nvidi
 	return run
 }
 
-// traceClaimForTest is a bound ReadWriteMany filesystem claim named request-traces.
 func traceClaimForTest() *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		Name: "request-traces", Namespace: "default",
@@ -860,13 +858,6 @@ func TestV1beta2RunControllerFailsARunWhoseTraceClaimCannotBeMounted(t *testing.
 			reason: `trace PersistentVolumeClaim "request-traces" in namespace "default" is a raw block volume`,
 		},
 		{
-			name: "ReadWriteOncePod-only claim",
-			mutate: func(claim *corev1.PersistentVolumeClaim) {
-				claim.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}
-			},
-			reason: `trace PersistentVolumeClaim "request-traces" in namespace "default" allows only ReadWriteOncePod access`,
-		},
-		{
 			name: "lost claim",
 			mutate: func(claim *corev1.PersistentVolumeClaim) {
 				claim.Status.Phase = corev1.ClaimLost
@@ -940,6 +931,9 @@ func TestV1beta2RunControllerAcceptsAnUnboundOrSharedTraceClaim(t *testing.T) {
 		}},
 		{name: "ReadWriteOnce claim", mutate: func(claim *corev1.PersistentVolumeClaim) {
 			claim.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+		}},
+		{name: "ReadWriteOncePod claim", mutate: func(claim *corev1.PersistentVolumeClaim) {
+			claim.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}
 		}},
 		{name: "claim without a volume mode", mutate: func(claim *corev1.PersistentVolumeClaim) {
 			claim.Spec.VolumeMode = nil

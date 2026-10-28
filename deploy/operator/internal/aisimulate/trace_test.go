@@ -55,7 +55,7 @@ func TestLowerTraceWorkload(t *testing.T) {
 				`"source":{"format":"dynamo","paths":["/var/run/aisimulate/trace/retune/w-1.jsonl.gz"],"type":"trace"}}`,
 		},
 		{
-			name: "overrides of load and stop still apply",
+			name: "a stop override still applies",
 			spec: withInputOverrides(withTrace(defaultedSpec(), nil), `{"traffic":{"stop":{"max_virtual_time_seconds":600}}}`),
 			wantTraffic: `{"load":{"type":"trace_timestamps"},` +
 				`"source":{"format":"dynamo","paths":["/var/run/aisimulate/trace/retune/w-1.jsonl.gz"],"type":"trace"},` +

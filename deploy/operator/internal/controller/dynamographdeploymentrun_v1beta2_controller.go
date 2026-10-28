@@ -206,8 +206,9 @@ const dgdrRunReasonTraceSourceUnavailable = "TraceSourceUnavailable"
 // it can or the Run replays no trace. The answer fails the Run terminally, so the claim is read
 // through the uncached API reader: a claim the cache has not observed yet must not end a Run, and
 // the Run controller watches no claims that could correct a cached miss later. A Pending claim is
-// accepted: a WaitForFirstConsumer claim binds only once its first pod is scheduled. Other read
-// errors are returned for a retry.
+// accepted: a WaitForFirstConsumer claim binds only once its first pod is scheduled. Access modes
+// are not checked: whether another pod holds a ReadWriteOnce or ReadWriteOncePod claim is a
+// scheduling question, not a terminal one. Other read errors are returned for a retry.
 func (r *DynamoGraphDeploymentRunV1beta2Reconciler) traceSourceUnavailable(
 	ctx context.Context,
 	run *nvidiacomv1beta2.DynamoGraphDeploymentRun,
@@ -232,28 +233,12 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) traceSourceUnavailable(
 		reason = "is being deleted"
 	case claim.Spec.VolumeMode != nil && *claim.Spec.VolumeMode == corev1.PersistentVolumeBlock:
 		reason = "is a raw block volume, not a filesystem"
-	case dgdrRunClaimIsReadWriteOncePodOnly(claim):
-		reason = "allows only ReadWriteOncePod access, so the Job cannot mount it beside its writer"
 	case claim.Status.Phase == corev1.ClaimLost:
 		reason = "has lost its PersistentVolume"
 	default:
 		return "", nil
 	}
 	return fmt.Sprintf("trace PersistentVolumeClaim %q in namespace %q %s", name, run.Namespace, reason), nil
-}
-
-// dgdrRunClaimIsReadWriteOncePodOnly reports whether the claim's only access mode is
-// ReadWriteOncePod, which its writer already holds.
-func dgdrRunClaimIsReadWriteOncePodOnly(claim *corev1.PersistentVolumeClaim) bool {
-	if len(claim.Spec.AccessModes) == 0 {
-		return false
-	}
-	for _, mode := range claim.Spec.AccessModes {
-		if mode != corev1.ReadWriteOncePod {
-			return false
-		}
-	}
-	return true
 }
 
 // failRunBeforeJob completes a Run that cannot start, without a Job. The Job-driven status machine
