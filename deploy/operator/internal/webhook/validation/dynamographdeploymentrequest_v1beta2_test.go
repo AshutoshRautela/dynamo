@@ -82,6 +82,15 @@ func TestValidateEnvelopeV1beta2Trace(t *testing.T) {
 			want: []string{"spec.aisimulate.inputOverrides.traffic.stop.requests: Forbidden: a trace replays every recorded request"},
 		},
 		{
+			name: "a trace rejects a scalar stop",
+			spec: `{` + model + `,"workload":{` + trace + `},"aisimulate":{"inputOverrides":{"traffic":{"stop":600}}}}`,
+			want: []string{"spec.aisimulate.inputOverrides.traffic.stop: Forbidden: must be an object or null"},
+		},
+		{
+			name: "a trace allows a null stop override",
+			spec: `{` + model + `,"workload":{` + trace + `},"aisimulate":{"inputOverrides":{"traffic":{"stop":null}}}}`,
+		},
+		{
 			name: "source overrides stay allowed without a trace",
 			spec: `{` + model + `,"aisimulate":{"inputOverrides":{"traffic":{"source":{"type":"trace","format":"dynamo","paths":["/x"]}}}}}`,
 		},

@@ -1199,6 +1199,18 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "v1beta2 a trace accepts no non-object stop override",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("w.jsonl")}
+				setV1beta2InputOverrides(spec, map[string]any{"traffic": map[string]any{"stop": []any{"requests"}}})
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantWebhook: []string{
+				"spec.aisimulate.inputOverrides.traffic.stop: Forbidden: must be an object or null",
+			},
+		},
+		{
 			name: "v1beta2 a trace accepts no count stop override",
 			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
 				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("w.jsonl")}
