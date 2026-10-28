@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 
+	nvidiacomv1beta2 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta2"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 )
 
@@ -25,9 +28,83 @@ func TestDynamoGraphDeploymentRequestCarrierObjectsStayWritable(t *testing.T) {
 	t.Run("native v1beta2 written through v1beta1", func(t *testing.T) {
 		carrierRoundTrip(t, beta2DGDRForAdmission(setBeta2AdmissionHardware), betaDGDRForAdmission(nil), "v1beta2")
 	})
+	t.Run("native v1beta2 trace written through v1beta1", func(t *testing.T) {
+		foreign := carrierRoundTrip(t, beta2DGDRForAdmission(setBeta2AdmissionTrace), betaDGDRForAdmission(nil), "v1beta2")
+
+		t.Log("The v1beta1 carrier holds the complete trace and no static default")
+		trace, found, err := unstructured.NestedMap(foreign.Object, "spec", "v1beta2", "workload", "trace")
+		if err != nil || !found {
+			t.Fatalf("spec.v1beta2.workload.trace found=%v err=%v", found, err)
+		}
+		path, _, _ := unstructured.NestedString(trace, "source", "pvc", "path")
+		if trace["format"] != "dynamo" || path != "retune/w-1.jsonl.gz" {
+			t.Fatalf("spec.v1beta2.workload.trace = %#v", trace)
+		}
+		if _, found, _ := unstructured.NestedFieldNoCopy(foreign.Object, "spec", "v1beta2", "workload", "static"); found {
+			t.Fatal("the carrier gained a static workload beside the trace")
+		}
+	})
 }
 
-func carrierRoundTrip(t *testing.T, ownerFixture, otherFixture runtime.Object, carrierKey string) {
+// A v1beta1 carrier has no trace schema, so a carrier seeded without admission can hold a trace
+// path the v1beta2 CEL rules reject. CEL ratcheting then admits every write that leaves that path
+// unchanged, which leaves the v1beta2 validating webhook as the only check on the next write.
+func TestDynamoGraphDeploymentRequestCarrierTraceIsValidatedOnTheNextWrite(t *testing.T) {
+	env := admissionEnv.ForTest(t)
+	admissionGate.set(features.Gates{GPUDiscovery: true})
+	setAdmissionH100Topology()
+	warnings := &warningRecorder{}
+	seeder := newAdmissionResourceClient(t, env, betaDGDRForAdmission(nil), legacySeedUsername, warnings)
+	unadmittedBeta2 := newAdmissionResourceClient(t, env, beta2DGDRForAdmission(nil), legacySeedUsername, warnings)
+	beta2 := newAdmissionResourceClient(t, env, beta2DGDRForAdmission(nil), "", warnings)
+
+	t.Log("Seed a v1beta1 carrier whose trace path leaves the claim, without admission")
+	carrier := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "nvidia.com/v1beta1",
+		"kind":       "DynamoGraphDeploymentRequest",
+		"metadata":   map[string]any{"name": "seeded-trace", "namespace": env.Namespace()},
+		"spec": map[string]any{"v1beta2": map[string]any{
+			"model":    map[string]any{"name": "Qwen/Qwen3-0.6B"},
+			"hardware": map[string]any{"gpu": map[string]any{"sku": "h100_sxm", "budget": int64(4)}},
+			"workload": map[string]any{"trace": map[string]any{
+				"format": "dynamo",
+				"source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": "../escape.jsonl"}},
+			}},
+		}},
+	}}
+	if _, err := seeder.Create(t.Context(), carrier, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed the carrier without admission: %v", err)
+	}
+
+	t.Log("The schema alone admits a v1beta2 write that keeps the invalid path")
+	if _, err := unadmittedBeta2.Patch(t.Context(), "seeded-trace", types.MergePatchType,
+		[]byte(`{"metadata":{"labels":{"trace-probe-unadmitted":"1"}}}`), metav1.PatchOptions{}); err != nil {
+		t.Fatalf("metadata patch without admission: %v", err)
+	}
+
+	t.Log("The validating webhook rejects the same write")
+	_, err := beta2.Patch(t.Context(), "seeded-trace", types.MergePatchType,
+		[]byte(`{"metadata":{"labels":{"trace-probe-admitted":"1"}}}`), metav1.PatchOptions{})
+	const want = `spec.workload.trace.source.pvc.path: Invalid value: "../escape.jsonl": path must be relative to the claim root`
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("metadata patch through admission: error = %v, want %q", err, want)
+	}
+}
+
+// setBeta2AdmissionTrace gives a v1beta2 Request hardware and a trace workload read from one claim file.
+func setBeta2AdmissionTrace(request *nvidiacomv1beta2.DynamoGraphDeploymentRequest) {
+	setBeta2AdmissionHardware(request)
+	request.Spec.Workload = &nvidiacomv1beta2.WorkloadSpec{Trace: &nvidiacomv1beta2.TraceWorkloadSpec{
+		Format: nvidiacomv1beta2.TraceFormatDynamo,
+		Source: nvidiacomv1beta2.TraceSourceSpec{PVC: &nvidiacomv1beta2.TracePVCSource{
+			ClaimName: "request-traces", Path: "retune/w-1.jsonl.gz",
+		}},
+	}}
+}
+
+// carrierRoundTrip writes a request through its owning version and through the other version, and
+// returns the other version's first view of it.
+func carrierRoundTrip(t *testing.T, ownerFixture, otherFixture runtime.Object, carrierKey string) *unstructured.Unstructured {
 	t.Helper()
 	env := admissionEnv.ForTest(t)
 	admissionGate.set(features.Gates{GPUDiscovery: true})
@@ -99,4 +176,5 @@ func carrierRoundTrip(t *testing.T, ownerFixture, otherFixture runtime.Object, c
 	if updated.GetGeneration() != created.GetGeneration() {
 		t.Fatalf("generation = %d, want %d: an unchanged update rewrote the spec", updated.GetGeneration(), created.GetGeneration())
 	}
+	return foreign
 }

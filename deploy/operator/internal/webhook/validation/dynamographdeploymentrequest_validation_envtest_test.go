@@ -1072,6 +1072,123 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 			discovered:   discoveredH200,
 			wantCELErr:   `spec.workload.static.load: Invalid value: exactly one of requestsPerSecond, concurrency, or kvCapacityFraction must be specified`,
 		},
+		// v1beta2 recorded-trace workload: the shared schema rules and the trace-owned source.
+		{
+			name: "v1beta2 trace workload is kept and receives no static default",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("retune/w-1.jsonl.gz")}
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			check: func(t *testing.T, result *unstructured.Unstructured) {
+				if _, found := v1beta2Field(t, result, "spec", "workload", "static"); found {
+					t.Fatal("workload.static was defaulted beside a trace")
+				}
+				if got := v1beta2String(t, result, "spec", "workload", "trace", "source", "pvc", "path"); got != "retune/w-1.jsonl.gz" {
+					t.Fatalf("workload.trace.source.pvc.path = %q", got)
+				}
+				if got := v1beta2String(t, result, "spec", "workload", "trace", "format"); got != "dynamo" {
+					t.Fatalf("workload.trace.format = %q, want dynamo", got)
+				}
+			},
+		},
+		{
+			name: "v1beta2 trace path that leaves the claim is rejected by CEL",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("retune/../../w.jsonl")}
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantCELErr:   `spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+		},
+		{
+			name: "v1beta2 absolute trace path is rejected by CEL",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("/w.jsonl")}
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantCELErr:   `spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+		},
+		{
+			name: "v1beta2 trace path with an empty segment is rejected by CEL",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("retune//w.jsonl")}
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantCELErr:   `spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+		},
+		{
+			name: "v1beta2 trace claim name must be a DNS subdomain",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				trace := v1beta2TraceForAdmission("w.jsonl")
+				trace["source"] = map[string]any{"pvc": map[string]any{"claimName": "Bad_Claim", "path": "w.jsonl"}}
+				spec["workload"] = map[string]any{"trace": trace}
+			}, nil),
+			gpuDiscovery:  true,
+			discovered:    discoveredH200,
+			wantSchemaErr: `spec.workload.trace.source.pvc.claimName: Invalid value: "Bad_Claim": spec.workload.trace.source.pvc.claimName in body should match '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'`,
+		},
+		{
+			name: "v1beta2 trace format is required",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				trace := v1beta2TraceForAdmission("w.jsonl")
+				delete(trace, "format")
+				spec["workload"] = map[string]any{"trace": trace}
+			}, nil),
+			gpuDiscovery:  true,
+			discovered:    discoveredH200,
+			wantSchemaErr: `spec.workload.trace.format: Required value`,
+		},
+		{
+			name: "v1beta2 trace format admits only dynamo",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				trace := v1beta2TraceForAdmission("w.jsonl")
+				trace["format"] = "mooncake"
+				spec["workload"] = map[string]any{"trace": trace}
+			}, nil),
+			gpuDiscovery:  true,
+			discovered:    discoveredH200,
+			wantSchemaErr: `spec.workload.trace.format: Unsupported value: "mooncake": supported values: "dynamo"`,
+		},
+		{
+			name: "v1beta2 trace source requires a pvc",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				trace := v1beta2TraceForAdmission("w.jsonl")
+				trace["source"] = map[string]any{}
+				spec["workload"] = map[string]any{"trace": trace}
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantCELErr:   `spec.workload.trace.source: Invalid value: pvc is required`,
+		},
+		{
+			name: "v1beta2 static and trace are mutually exclusive",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"static": map[string]any{}, "trace": v1beta2TraceForAdmission("w.jsonl")}
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantCELErr:   `spec.workload: Invalid value: static and trace are mutually exclusive`,
+		},
+		{
+			name: "v1beta2 input overrides cannot change the trace source",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("w.jsonl")}
+				setV1beta2InputOverrides(spec, map[string]any{"traffic": map[string]any{
+					"source": map[string]any{"type": "synthetic", "format": "mooncake", "paths": []any{"/etc/passwd"}},
+					"load":   map[string]any{"speedup": 2.0},
+				}})
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantWebhook: []string{
+				"spec.aisimulate.inputOverrides.traffic.source.format: Forbidden: is owned by spec.workload.trace and cannot be overridden",
+				"spec.aisimulate.inputOverrides.traffic.source.paths: Forbidden: is owned by spec.workload.trace and cannot be overridden",
+				"spec.aisimulate.inputOverrides.traffic.source.type: Forbidden: is owned by spec.workload.trace and cannot be overridden",
+			},
+		},
 		// v1beta2 UPDATE: defaults stay idempotent, hardware is never rediscovered, and any
 		// spec change is fully validated.
 		{
@@ -1206,6 +1323,50 @@ func TestDynamoGraphDeploymentRunSpecIsImmutable(t *testing.T) {
 			})
 			if tt.wantCELErr == "" && actual.GetGeneration() != 1 {
 				t.Fatalf("generation = %d, want 1 for a metadata-only update", actual.GetGeneration())
+			}
+		})
+	}
+}
+
+// A Run has no admission webhook, so the trace rules it shares with the Request must hold in its
+// own CRD schema: a directly created Run cannot name a file outside its claim.
+func TestDynamoGraphDeploymentRunTraceIsValidatedByTheCRD(t *testing.T) {
+	tests := []struct {
+		name       string
+		tracePath  string
+		withStatic bool
+		wantCELErr string
+	}{
+		{name: "a valid trace is stored", tracePath: "retune/w-1.jsonl.gz"},
+		{
+			name:       "a path that leaves the claim is rejected",
+			tracePath:  "../w.jsonl",
+			wantCELErr: `spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+		},
+		{
+			name:       "static beside a trace is rejected",
+			tracePath:  "retune/w-1.jsonl.gz",
+			withStatic: true,
+			wantCELErr: `spec.workload: Invalid value: static and trace are mutually exclusive`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run := v1beta2RunForAdmission(v1beta2AdmissionModel, nil)
+			run.Spec.Workload = &nvidiacomv1beta2.WorkloadSpec{Trace: &nvidiacomv1beta2.TraceWorkloadSpec{
+				Format: nvidiacomv1beta2.TraceFormatDynamo,
+				Source: nvidiacomv1beta2.TraceSourceSpec{PVC: &nvidiacomv1beta2.TracePVCSource{
+					ClaimName: "request-traces", Path: tt.tracePath,
+				}},
+			}}
+			if tt.withStatic {
+				run.Spec.Workload.Static = &nvidiacomv1beta2.StaticWorkloadSpec{}
+			}
+			actual := runAdmissionTest(t, admissionTestCase{object: run, wantCELError: tt.wantCELErr})
+			if tt.wantCELErr == "" {
+				if got := v1beta2String(t, actual, "spec", "workload", "trace", "source", "pvc", "path"); got != "retune/w-1.jsonl.gz" {
+					t.Fatalf("stored workload.trace.source.pvc.path = %q, want the trace kept", got)
+				}
 			}
 		})
 	}
@@ -1449,6 +1610,14 @@ func v1beta2DGDRForAdmission(mutate func(spec map[string]any), labels map[string
 		"metadata":   metadata,
 		"spec":       spec,
 	}}
+}
+
+// v1beta2TraceForAdmission is an unstructured dynamo trace read from one file of request-traces.
+func v1beta2TraceForAdmission(path string) map[string]any {
+	return map[string]any{
+		"format": "dynamo",
+		"source": map[string]any{"pvc": map[string]any{"claimName": "request-traces", "path": path}},
+	}
 }
 
 // mustJSONObject decodes a native AISimulate input override document.

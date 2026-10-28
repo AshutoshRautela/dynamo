@@ -54,7 +54,8 @@ const (
 // objective.mode, the scalar metric, objective.sla, recommendation.maxCandidates,
 // workload.static and the cluster hardware. workload.static: {} opts out of the static
 // workload; a nonempty static object receives any missing inputTokens, outputTokens and load
-// defaults. objective.sla: {} opts out of the latency defaults.
+// defaults, and workload.trace suppresses the static default. objective.sla: {} opts out of the
+// latency defaults.
 // spec.aisimulate.inputOverrides never changes a default. It overrides the defaulted typed
 // values later, when the input is lowered.
 
@@ -205,6 +206,10 @@ func defaultGPUHardwareSpecV1beta2(gpu *nvidiacomv1beta2.GPUHardwareSpec, defaul
 }
 
 func defaultWorkloadSpecV1beta2(workload *nvidiacomv1beta2.WorkloadSpec) {
+	// A trace is the complete traffic model; it receives no static default and no format default.
+	if workload.Trace != nil {
+		return
+	}
 	if workload.Static == nil {
 		workload.Static = &nvidiacomv1beta2.StaticWorkloadSpec{}
 	} else if workload.Static.InputTokens == nil && workload.Static.OutputTokens == nil && workload.Static.Load == nil {

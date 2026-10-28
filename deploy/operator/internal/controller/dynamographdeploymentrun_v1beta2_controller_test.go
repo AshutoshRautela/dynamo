@@ -16,11 +16,13 @@ import (
 
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
 	nvidiacomv1beta2 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta2"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/aisimulate"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dgdrrunpublisher"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/gpu"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,6 +33,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 )
 
@@ -364,6 +367,9 @@ func assertDGDRRunJobIsolation(
 		!hasMountAt(publisher.VolumeMounts, dgdrRunSnapshotVolume, dgdrRunSnapshotPath) {
 		t.Fatal("sweeper and publisher do not share the frozen snapshot directory")
 	}
+	if hasMount(publisher.VolumeMounts, dgdrRunTraceVolume) {
+		t.Fatal("publisher unexpectedly mounts the trace claim")
+	}
 }
 
 func assertDGDRRunStatusInputMatchesConfigMap(
@@ -689,4 +695,286 @@ func hasMountAt(mounts []corev1.VolumeMount, name, path string) bool {
 		}
 	}
 	return false
+}
+
+// dgdrRunWithTraceForTest is dgdrRunForTest replaying one file of the request-traces claim.
+func dgdrRunWithTraceForTest(t *testing.T, inputOverrides map[string]any) *nvidiacomv1beta2.DynamoGraphDeploymentRun {
+	t.Helper()
+	run := dgdrRunForTest(t, inputOverrides)
+	run.Spec.Workload = &nvidiacomv1beta2.WorkloadSpec{Trace: &nvidiacomv1beta2.TraceWorkloadSpec{
+		Format: nvidiacomv1beta2.TraceFormatDynamo,
+		Source: nvidiacomv1beta2.TraceSourceSpec{PVC: &nvidiacomv1beta2.TracePVCSource{
+			ClaimName: "request-traces", Path: "retune/w-1.jsonl.gz",
+		}},
+	}}
+	return run
+}
+
+// traceClaimForTest is a bound ReadWriteMany filesystem claim named request-traces.
+func traceClaimForTest() *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		Name: "request-traces", Namespace: "default",
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			VolumeMode:  ptr.To(corev1.PersistentVolumeFilesystem),
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+}
+
+func TestV1beta2RunControllerMountsTheTraceClaimReadOnlyIntoTheSweeperOnly(t *testing.T) {
+	run := dgdrRunWithTraceForTest(t, map[string]any{})
+	f := newDGDRRunFixture(t, &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}, run, traceClaimForTest())
+	f.reconcile()
+
+	t.Log("The pod mounts the whole claim read-only as the trace volume")
+	job := f.job()
+	var trace *corev1.Volume
+	for i := range job.Spec.Template.Spec.Volumes {
+		if job.Spec.Template.Spec.Volumes[i].Name == dgdrRunTraceVolume {
+			trace = &job.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if trace == nil || trace.PersistentVolumeClaim == nil ||
+		trace.PersistentVolumeClaim.ClaimName != "request-traces" || !trace.PersistentVolumeClaim.ReadOnly {
+		t.Fatalf("trace volume = %#v, want the read-only request-traces claim", trace)
+	}
+
+	t.Log("Only the sweeper mounts it, read-only and without a subPath")
+	sweeper := containerNamed(t, job.Spec.Template.Spec.Containers, dgdrRunSweeperContainer)
+	want := corev1.VolumeMount{Name: dgdrRunTraceVolume, MountPath: aisimulate.TraceMountPath, ReadOnly: true}
+	var traceMounts []corev1.VolumeMount
+	for _, mount := range sweeper.VolumeMounts {
+		if mount.Name == dgdrRunTraceVolume {
+			traceMounts = append(traceMounts, mount)
+		}
+	}
+	if !reflect.DeepEqual(traceMounts, []corev1.VolumeMount{want}) {
+		t.Fatalf("sweeper trace mounts = %#v, want exactly %#v", traceMounts, want)
+	}
+	assertDGDRRunJobIsolation(t, job, run, f.reconciler.PlannerImage, f.reconciler.OperatorImage)
+
+	t.Log("The frozen input reads the trace file under the mount")
+	configMap := &corev1.ConfigMap{}
+	if err := f.client.Get(t.Context(), client.ObjectKeyFromObject(job), configMap); err != nil {
+		t.Fatalf("get ConfigMap: %v", err)
+	}
+	var input map[string]any
+	if err := yaml.Unmarshal([]byte(configMap.Data[dgdrRunInputKey]), &input); err != nil {
+		t.Fatalf("decode input: %v", err)
+	}
+	source := input["traffic"].(map[string]any)["source"].(map[string]any)
+	if !reflect.DeepEqual(source["paths"], []any{"/var/run/aisimulate/trace/retune/w-1.jsonl.gz"}) {
+		t.Fatalf("traffic.source.paths = %v", source["paths"])
+	}
+}
+
+func TestDGDRRunInputEnforcesTheTypedTraceSource(t *testing.T) {
+	t.Log("Lower a Run whose overrides try to replace the trace source and change the load")
+	run := dgdrRunWithTraceForTest(t, map[string]any{"traffic": map[string]any{
+		"source": map[string]any{"type": "synthetic", "format": "mooncake", "paths": []any{"/etc/passwd"}},
+		"load":   map[string]any{"speedup": 4},
+	}})
+	input, err := dgdrRunInput(run, "example.com/dynamo-planner:1.2.3", "1.2.3", 8)
+	if err != nil {
+		t.Fatalf("lower input: %v", err)
+	}
+
+	t.Log("The typed trace wins for the source; the load override is kept")
+	traffic := input["traffic"].(map[string]any)
+	wantSource := map[string]any{"type": "trace", "format": "dynamo", "paths": []any{"/var/run/aisimulate/trace/retune/w-1.jsonl.gz"}}
+	if !reflect.DeepEqual(traffic["source"], wantSource) {
+		t.Fatalf("traffic.source = %#v, want %#v", traffic["source"], wantSource)
+	}
+	load := traffic["load"].(map[string]any)
+	if load["type"] != "trace_timestamps" || load["speedup"] != json.Number("4") {
+		t.Fatalf("traffic.load = %#v, want trace_timestamps with the override speedup", load)
+	}
+	if _, found := traffic["stop"]; found {
+		t.Fatalf("traffic.stop = %#v, want none for a trace", traffic["stop"])
+	}
+}
+
+func TestV1beta2RunControllerFailsARunWhoseTraceClaimCannotBeMounted(t *testing.T) {
+	tests := []struct {
+		name    string
+		missing bool
+		mutate  func(*corev1.PersistentVolumeClaim)
+		reason  string
+	}{
+		{
+			name:    "missing claim",
+			missing: true,
+			reason:  `trace PersistentVolumeClaim "request-traces" does not exist in namespace "default"`,
+		},
+		{
+			name: "claim being deleted",
+			mutate: func(claim *corev1.PersistentVolumeClaim) {
+				claim.DeletionTimestamp = new(metav1.Now())
+				claim.Finalizers = []string{"kubernetes.io/pvc-protection"}
+			},
+			reason: `trace PersistentVolumeClaim "request-traces" in namespace "default" is being deleted`,
+		},
+		{
+			name: "raw block claim",
+			mutate: func(claim *corev1.PersistentVolumeClaim) {
+				claim.Spec.VolumeMode = ptr.To(corev1.PersistentVolumeBlock)
+			},
+			reason: `trace PersistentVolumeClaim "request-traces" in namespace "default" is a raw block volume`,
+		},
+		{
+			name: "ReadWriteOncePod-only claim",
+			mutate: func(claim *corev1.PersistentVolumeClaim) {
+				claim.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}
+			},
+			reason: `trace PersistentVolumeClaim "request-traces" in namespace "default" allows only ReadWriteOncePod access`,
+		},
+		{
+			name: "lost claim",
+			mutate: func(claim *corev1.PersistentVolumeClaim) {
+				claim.Status.Phase = corev1.ClaimLost
+			},
+			reason: `trace PersistentVolumeClaim "request-traces" in namespace "default" has lost its PersistentVolume`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hardware := &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}
+			objects := []client.Object{dgdrRunWithTraceForTest(t, map[string]any{})}
+			if !tt.missing {
+				claim := traceClaimForTest()
+				tt.mutate(claim)
+				objects = append(objects, claim)
+			}
+			f := newDGDRRunFixture(t, hardware, objects...)
+
+			t.Log("Reconcile twice: the first pass fails the Run, the second sees it completed")
+			f.reconcile()
+			f.reconcile()
+
+			t.Log("The Run is Failed and Completed with the claim named in the message")
+			run := f.run()
+			condition := meta.FindStatusCondition(run.Status.Conditions, nvidiacomv1beta2.DGDRRunConditionCompleted)
+			if run.Status.Phase != nvidiacomv1beta2.DGDRRunPhaseFailed || condition == nil ||
+				condition.Status != metav1.ConditionTrue || condition.Reason != dgdrRunReasonTraceSourceUnavailable {
+				t.Fatalf("status = %+v, want Failed and Completed=True/%s", run.Status, dgdrRunReasonTraceSourceUnavailable)
+			}
+			if !strings.HasPrefix(condition.Message, tt.reason) || run.Status.CompletionTime == nil || run.Status.JobRef != nil {
+				t.Fatalf("condition message = %q, completionTime = %v, jobRef = %v; want message prefix %q",
+					condition.Message, run.Status.CompletionTime, run.Status.JobRef, tt.reason)
+			}
+			if condition.ObservedGeneration != run.Generation {
+				t.Fatalf("condition observedGeneration = %d, want %d", condition.ObservedGeneration, run.Generation)
+			}
+
+			t.Log("Nothing was discovered or created for the Run")
+			if len(hardware.calls) != 0 {
+				t.Fatalf("hardware discovery calls = %v, want none", hardware.calls)
+			}
+			assertNoDGDRRunResources(t, f.client)
+		})
+	}
+}
+
+// assertNoDGDRRunResources fails when the Run controller created any Job, input ConfigMap or
+// publisher RBAC object in the default namespace.
+func assertNoDGDRRunResources(t *testing.T, c client.Client) {
+	t.Helper()
+	for _, list := range []client.ObjectList{
+		&batchv1.JobList{}, &corev1.ConfigMapList{}, &corev1.ServiceAccountList{},
+		&rbacv1.RoleList{}, &rbacv1.RoleBindingList{},
+	} {
+		if err := c.List(t.Context(), list, client.InNamespace("default")); err != nil {
+			t.Fatalf("list %T: %v", list, err)
+		}
+		if n := meta.LenList(list); n != 0 {
+			t.Fatalf("%T has %d items, want none", list, n)
+		}
+	}
+}
+
+func TestV1beta2RunControllerAcceptsAnUnboundOrSharedTraceClaim(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*corev1.PersistentVolumeClaim)
+	}{
+		{name: "WaitForFirstConsumer claim still Pending", mutate: func(claim *corev1.PersistentVolumeClaim) {
+			claim.Status.Phase = corev1.ClaimPending
+		}},
+		{name: "ReadWriteOnce claim on the writer's node", mutate: func(claim *corev1.PersistentVolumeClaim) {
+			claim.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce, corev1.ReadWriteOncePod}
+		}},
+		{name: "claim without a volume mode", mutate: func(claim *corev1.PersistentVolumeClaim) {
+			claim.Spec.VolumeMode = nil
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claim := traceClaimForTest()
+			tt.mutate(claim)
+			f := newDGDRRunFixture(t, &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}, dgdrRunWithTraceForTest(t, map[string]any{}), claim)
+			f.reconcile()
+			assertDGDRRunPendingStatus(t, f.run(), f.job().Name)
+		})
+	}
+}
+
+func TestV1beta2RunControllerRetriesATransientTraceClaimReadError(t *testing.T) {
+	hardware := &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}
+	f := newDGDRRunFixture(t, hardware, dgdrRunWithTraceForTest(t, map[string]any{}), traceClaimForTest())
+	f.reconciler.APIReader = interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+				return errors.New("API server unavailable")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	t.Log("A read error other than NotFound is returned for a retry")
+	_, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.run())})
+	if err == nil || !strings.Contains(err.Error(), "API server unavailable") {
+		t.Fatalf("reconcile error = %v, want the claim read error", err)
+	}
+
+	t.Log("The Run stays open, and nothing was discovered or created for it")
+	if run := f.run(); run.Status.Phase != "" || len(run.Status.Conditions) != 0 {
+		t.Fatalf("status = %+v, want untouched", run.Status)
+	}
+	if len(hardware.calls) != 0 {
+		t.Fatalf("hardware discovery calls = %v, want none", hardware.calls)
+	}
+	assertNoDGDRRunResources(t, f.client)
+}
+
+func TestV1beta2RunControllerKeepsFollowingAJobAfterItsTraceClaimDisappears(t *testing.T) {
+	f := newDGDRRunFixture(t, &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}, dgdrRunWithTraceForTest(t, map[string]any{}), traceClaimForTest())
+	f.reconcile()
+	jobName := f.job().Name
+
+	t.Log("Delete the claim after the Job was created and its jobRef recorded")
+	if err := f.client.Delete(t.Context(), traceClaimForTest()); err != nil {
+		t.Fatalf("delete claim: %v", err)
+	}
+
+	t.Log("Hide the Job from the cached List, as a lagging informer would")
+	cached := f.reconciler.Client
+	f.reconciler.Client = interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*batchv1.JobList); ok {
+				return nil
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+	_, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.run())})
+	if !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("reconcile error = %v, want the Job create to hit AlreadyExists until the cache catches up", err)
+	}
+	assertDGDRRunPendingStatus(t, f.run(), jobName)
+
+	t.Log("Once the cache shows the Job again, the Job still drives the Run")
+	f.reconciler.Client = cached
+	f.reconcile()
+	assertDGDRRunPendingStatus(t, f.run(), jobName)
 }

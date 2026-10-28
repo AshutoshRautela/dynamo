@@ -20,6 +20,7 @@ package defaulting
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -302,5 +303,79 @@ func TestDefaultEnvelopeV1beta2LeavesUnchangedEnvelopeUntouched(t *testing.T) {
 	}
 	if string(dgdr.Spec.V1Beta2.Raw) != original {
 		t.Fatalf("envelope was rewritten without a change: %q", dgdr.Spec.V1Beta2.Raw)
+	}
+}
+
+// traceWorkloadV1beta2ForTest is a trace as a client sends it, without the required format.
+func traceWorkloadV1beta2ForTest() *nvidiacomv1beta2.TraceWorkloadSpec {
+	return &nvidiacomv1beta2.TraceWorkloadSpec{
+		Source: nvidiacomv1beta2.TraceSourceSpec{PVC: &nvidiacomv1beta2.TracePVCSource{ClaimName: "traces", Path: "w.jsonl"}},
+	}
+}
+
+func TestDefaultWorkloadSpecV1beta2(t *testing.T) {
+	defaultStatic := &nvidiacomv1beta2.StaticWorkloadSpec{
+		InputTokens:  new(defaultStaticInputTokensV1beta2),
+		OutputTokens: new(defaultStaticOutputTokensV1beta2),
+		Load:         &nvidiacomv1beta2.StaticLoadSpec{Concurrency: new(defaultStaticConcurrencyV1beta2)},
+	}
+	tests := []struct {
+		name string
+		in   *nvidiacomv1beta2.WorkloadSpec
+		want *nvidiacomv1beta2.WorkloadSpec
+	}{
+		{
+			name: "an empty workload receives the static default",
+			in:   &nvidiacomv1beta2.WorkloadSpec{},
+			want: &nvidiacomv1beta2.WorkloadSpec{Static: defaultStatic},
+		},
+		{
+			name: "a trace receives neither a static nor a format default",
+			in:   &nvidiacomv1beta2.WorkloadSpec{Trace: traceWorkloadV1beta2ForTest()},
+			want: &nvidiacomv1beta2.WorkloadSpec{Trace: traceWorkloadV1beta2ForTest()},
+		},
+		{
+			name: "static beside a trace is left for validation to reject",
+			in:   &nvidiacomv1beta2.WorkloadSpec{Static: &nvidiacomv1beta2.StaticWorkloadSpec{}, Trace: traceWorkloadV1beta2ForTest()},
+			want: &nvidiacomv1beta2.WorkloadSpec{Static: &nvidiacomv1beta2.StaticWorkloadSpec{}, Trace: traceWorkloadV1beta2ForTest()},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Log("Default the workload twice and expect the same complete result")
+			defaultWorkloadSpecV1beta2(tt.in)
+			first := tt.in.DeepCopy()
+			defaultWorkloadSpecV1beta2(tt.in)
+			if !reflect.DeepEqual(tt.in, first) {
+				t.Fatalf("not idempotent:\n%#v\n%#v", first, tt.in)
+			}
+			if !reflect.DeepEqual(tt.in, tt.want) {
+				t.Fatalf("workload = %#v, want %#v", tt.in, tt.want)
+			}
+		})
+	}
+}
+
+func TestDefaultEnvelopeV1beta2KeepsATraceWithoutStaticDefault(t *testing.T) {
+	t.Log("Admit a model-only trace Request through the v1beta2 envelope")
+	spec := modelOnlySpecV1beta2()
+	spec.Workload = &nvidiacomv1beta2.WorkloadSpec{Trace: traceWorkloadV1beta2ForTest()}
+	spec.Workload.Trace.Format = nvidiacomv1beta2.TraceFormatDynamo
+	want := spec.Workload.DeepCopy()
+	dgdr := v1beta2Envelope(t, spec)
+	if err := defaultDynamoGraphDeploymentRequestV1beta2(context.Background(), dgdr, admissionv1.Create, nil, DGDRV1beta2Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("The trace is kept exactly and no static workload appears")
+	var got nvidiacomv1beta2.DynamoGraphDeploymentRequestSpec
+	if err := json.Unmarshal(dgdr.Spec.V1Beta2.Raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Workload, want) {
+		t.Fatalf("workload = %#v, want %#v", got.Workload, want)
+	}
+	if got.Objective == nil || got.Recommendation == nil {
+		t.Fatalf("other defaults are still applied: %+v", got)
 	}
 }

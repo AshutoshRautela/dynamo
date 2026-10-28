@@ -1059,6 +1059,80 @@ kubectl get dgdr my-model -n $NAMESPACE \
 - The relationship is tracked via labels: `dgdr.nvidia.com/name` and `dgdr.nvidia.com/namespace`.
 - Additional resources (planner ConfigMaps) are created in the same namespace and labeled with `dgdr.nvidia.com/name`.
 
+## Replay a recorded trace (v1beta2)
+
+<Warning>
+The `nvidia.com/v1beta2` API is experimental and disabled by default. See the
+[installation guide](../../kubernetes/installation/install-dynamo.md) before you enable it.
+</Warning>
+
+A native `v1beta2` request can evaluate every candidate against a recorded request trace instead
+of synthetic traffic. Set `spec.workload.trace` instead of `spec.workload.static`; the two are
+mutually exclusive, and admission adds no static default when `trace` is set. To switch an existing
+request from static traffic to a trace, set `spec.workload.static` to `null` in the same update.
+
+```yaml
+apiVersion: nvidia.com/v1beta2
+kind: DynamoGraphDeploymentRequest
+metadata:
+  name: qwen3-trace-replay
+spec:
+  model:
+    name: Qwen/Qwen3-0.6B
+  workload:
+    trace:
+      format: dynamo                          # required; no default
+      source:
+        pvc:
+          claimName: request-traces           # PersistentVolumeClaim in this namespace
+          path: windows/2026-10-27T10-00.jsonl.gz
+      replay:
+        arrivalSpeedupRatio: 1.0              # optional; 2.0 replays arrivals twice as fast
+```
+
+Before you create the request:
+
+- Create the PersistentVolumeClaim in the request's namespace. Use a filesystem volume, not
+  `volumeMode: Block`, and not a `ReadWriteOncePod`-only claim. When the process that writes the
+  trace runs on other nodes, use `ReadWriteMany`. With `ReadWriteOnce`, a Job scheduled to another
+  node waits in `ContainerCreating` while the Run reports `Running`.
+- Finish writing the file. `path` names one file relative to the claim root; directories and globs
+  are not expanded. Every Run of the request reads the file when its Job starts, so do not rewrite
+  it afterwards. To replay several rolled `jsonl_gz` segments, concatenate them into one `.jsonl.gz`
+  file.
+- Make the file world-readable (for example, mode `0644` in `0755` directories) or readable by
+  group `65532`, the Job's `fsGroup`. The operator mounts the whole claim read-only at
+  `/var/run/aisimulate/trace`, only into the AISimulate container, and Kubernetes does not change
+  the ownership of a read-only volume for `fsGroup`.
+
+`format: dynamo` is the only admitted format. It reads the Dynamo request trace
+(`dynamo.request.trace.v1`) written by the frontend, as JSON Lines or as gzip-compressed JSON Lines
+when the file name ends in `.gz`. See the [Request Trace Reference](../observability/request-traces.mdx).
+
+The operator lowers the trace to the AISimulate input `traffic.source` (`type: trace`, `format`, and
+`paths`) and `traffic.load.type: trace_timestamps`, with `traffic.load.speedup` when
+`arrivalSpeedupRatio` is set. It adds no `traffic.stop.requests`. When `trace` is set,
+`spec.aisimulate.inputOverrides` cannot set `traffic.source.type`, `traffic.source.format`, or
+`traffic.source.paths`, or replace `traffic` or `traffic.source` with a non-object value. Admission
+rejects these overrides, and the Run controller restores the typed values. Overrides of
+`traffic.load` and `traffic.stop.max_virtual_time_seconds` still apply.
+
+If the claim does not exist, is being deleted, is a block volume, allows only `ReadWriteOncePod`, or
+has lost its volume, the Run fails before its Job is created, and its `Completed` condition has
+reason `TraceSourceUnavailable`. A claim that is still `Pending`, such as one that waits for its
+first consumer, is accepted. The request starts one Run per `metadata.generation`, so after you fix
+the claim, change the request's `spec` to start a new Run.
+
+```bash
+# Active and recent Runs of the request
+kubectl get dynamographdeploymentrequests.v1beta2.nvidia.com qwen3-trace-replay -n "$NAMESPACE" \
+  -o jsonpath='{.status.activeRunRef}{"\n"}{.status.recentRunRefs}{"\n"}'
+
+# Why a Run failed
+kubectl get dynamographdeploymentrun qwen3-trace-replay-1 -n "$NAMESPACE" \
+  -o jsonpath='{.status.conditions}'
+```
+
 ## Known issues
 
 - **PCIe profiler data not yet available.** See the PCIe callout under [SKU format](#sku-format).

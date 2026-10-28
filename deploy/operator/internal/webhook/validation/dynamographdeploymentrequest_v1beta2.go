@@ -56,8 +56,12 @@ func validateDynamoGraphDeploymentRequestSpecV1beta2(
 	spec *nvidiacomv1beta2.DynamoGraphDeploymentRequestSpec,
 	fldPath *field.Path,
 ) field.ErrorList {
-	if spec.AISimulate == nil {
-		return nil
+	allErrs := field.ErrorList{}
+	if spec.Workload != nil {
+		allErrs = append(allErrs, aisimulate.ValidateTraceWorkload(spec.Workload, fldPath.Child("workload"))...)
 	}
-	return validateAISimulateSpec(spec.AISimulate, fldPath.Child("aisimulate"))
+	if spec.AISimulate != nil {
+		allErrs = append(allErrs, validateAISimulateSpec(spec.AISimulate, spec.Workload, fldPath.Child("aisimulate"))...)
+	}
+	return allErrs
 }

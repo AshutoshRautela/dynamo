@@ -29,6 +29,7 @@ import (
 
 	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
 	nvidiacomv1beta2 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta2"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/aisimulate"
 	commonController "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -201,9 +203,17 @@ func (r *DynamoGraphDeploymentRequestV1beta2Reconciler) Reconcile(
 // buildRun snapshots the admitted typed input into an immutable Run. Admission has already
 // persisted Request defaults and discovered hardware. The Run controller lowers this snapshot once,
 // applies inputOverrides last, and records the exact effective input in status.aisimulate.input.
+// The workload trace is checked again because the Run CRD enforces the same rules: a trace that
+// reached the Request without admission, such as through a webhook that failed open, would
+// otherwise fail every Run create instead of being reported once as an invalid spec.
 func (r *DynamoGraphDeploymentRequestV1beta2Reconciler) buildRun(
 	request *nvidiacomv1beta2.DynamoGraphDeploymentRequest,
 ) (*nvidiacomv1beta2.DynamoGraphDeploymentRun, error) {
+	if workload := request.Spec.Workload; workload != nil {
+		if errs := aisimulate.ValidateTraceWorkload(workload, field.NewPath("spec", "workload")); len(errs) > 0 {
+			return nil, errs.ToAggregate()
+		}
+	}
 	frozen := request.Spec.NativeSearchInput.DeepCopy()
 	run := &nvidiacomv1beta2.DynamoGraphDeploymentRun{
 		Name:        dgdrV1beta2RunName(request),

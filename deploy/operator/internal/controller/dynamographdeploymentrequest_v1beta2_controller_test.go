@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -624,5 +625,50 @@ func TestV1beta2RequestControllerPreservesInputOverridesForRunLowering(t *testin
 	request.Spec.AISimulate.InputOverrides.Raw[0] = '['
 	if got := string(run.Spec.AISimulate.InputOverrides.Raw); got != overrides {
 		t.Fatalf("Run inputOverrides changed with the Request: %s", got)
+	}
+}
+
+func TestV1beta2RequestControllerReportsAnInvalidTraceInsteadOfCreatingARun(t *testing.T) {
+	tests := []struct {
+		name        string
+		tracePath   string
+		wantRuns    []string
+		wantReason  string
+		wantMessage string
+	}{
+		{
+			name:       "a valid trace is snapshotted into the Run",
+			tracePath:  "retune/w-1.jsonl.gz",
+			wantRuns:   []string{"search-1"},
+			wantReason: dgdrReasonRunCreated,
+		},
+		{
+			name:        "a trace path that bypassed admission is reported once",
+			tracePath:   "../escape.jsonl",
+			wantReason:  dgdrReasonInvalidSpec,
+			wantMessage: `spec.workload.trace.source.pvc.path: Invalid value: "../escape.jsonl"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := dgdrV1beta2Request(true)
+			request.Spec.Workload = &nvidiacomv1beta2.WorkloadSpec{Trace: &nvidiacomv1beta2.TraceWorkloadSpec{
+				Format: nvidiacomv1beta2.TraceFormatDynamo,
+				Source: nvidiacomv1beta2.TraceSourceSpec{PVC: &nvidiacomv1beta2.TracePVCSource{
+					ClaimName: "request-traces", Path: tt.tracePath,
+				}},
+			}}
+			f := newDGDRV1beta2Fixture(t, request)
+			f.reconcile()
+
+			t.Log("Only a valid trace becomes a Run; an invalid one is a condition, not a retried create")
+			if names := f.runNames(); !slices.Equal(names, tt.wantRuns) {
+				t.Fatalf("runs = %v, want %v", names, tt.wantRuns)
+			}
+			condition := dgdrV1beta2AcceptedCondition(t, f.request())
+			if condition.Reason != tt.wantReason || !strings.HasPrefix(condition.Message, tt.wantMessage) {
+				t.Fatalf("Accepted = %+v, want reason %s and message prefix %q", condition, tt.wantReason, tt.wantMessage)
+			}
+		})
 	}
 }

@@ -65,6 +65,7 @@ const (
 	dgdrRunPublisherContainer      = "publisher"
 	dgdrRunInputVolume             = "input"
 	dgdrRunSnapshotVolume          = "snapshot"
+	dgdrRunTraceVolume             = "trace"
 	dgdrRunServiceAccountVolume    = "publisher-kube-api"
 	dgdrRunGPUsPerNodeAnnotation   = "nvidia.com/dgdr-gpus-per-node"
 	dgdrRunSnapshotPathAnnotation  = "nvidia.com/dgdr-snapshot-path"
@@ -112,6 +113,7 @@ type DynamoGraphDeploymentRunV1beta2Reconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get
 // +kubebuilder:rbac:groups="",resources=configmaps;serviceaccounts,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch
 
@@ -137,6 +139,20 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) Reconcile(
 	var job *batchv1.Job
 	if len(jobs) == 1 {
 		job = &jobs[0]
+	}
+
+	// A Job that can never mount its trace would keep the Run active forever, so a Run that has not
+	// created its Job checks the claim before anything is discovered or created for it. A recorded
+	// jobRef means the Job was created even if the cache does not show it yet; that Job keeps
+	// driving the Run, whatever happens to the claim later.
+	if job == nil && run.Status.JobRef == nil {
+		unavailable, err := r.traceSourceUnavailable(ctx, run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if unavailable != "" {
+			return ctrl.Result{}, r.failRunBeforeJob(ctx, run, dgdrRunReasonTraceSourceUnavailable, unavailable)
+		}
 	}
 	resourceName := dgdrRunResourceName(run.Name)
 	if err := r.reconcilePublisherAccess(ctx, run, resourceName); err != nil {
@@ -181,6 +197,86 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) ownedJobs(
 		}
 	}
 	return owned, nil
+}
+
+// dgdrRunReasonTraceSourceUnavailable completes a Run whose Job could never mount its trace claim.
+const dgdrRunReasonTraceSourceUnavailable = "TraceSourceUnavailable"
+
+// traceSourceUnavailable returns why a new Job could not mount the Run's trace claim, or "" when
+// it can or the Run replays no trace. The answer fails the Run terminally, so the claim is read
+// through the uncached API reader: a claim the cache has not observed yet must not end a Run, and
+// the Run controller watches no claims that could correct a cached miss later. A Pending claim is
+// accepted: a WaitForFirstConsumer claim binds only once its first pod is scheduled. Other read
+// errors are returned for a retry.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) traceSourceUnavailable(
+	ctx context.Context,
+	run *nvidiacomv1beta2.DynamoGraphDeploymentRun,
+) (string, error) {
+	if run.Spec.Workload == nil || run.Spec.Workload.Trace == nil || run.Spec.Workload.Trace.Source.PVC == nil {
+		return "", nil
+	}
+	name := run.Spec.Workload.Trace.Source.PVC.ClaimName
+	claim := &corev1.PersistentVolumeClaim{}
+	err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, claim)
+	if apierrors.IsNotFound(err) {
+		return fmt.Sprintf("trace PersistentVolumeClaim %q does not exist in namespace %q", name, run.Namespace), nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get trace PersistentVolumeClaim %q in namespace %q: %w", name, run.Namespace, err)
+	}
+
+	// Each state below keeps the Job from ever mounting the claim read-only as a filesystem.
+	reason := ""
+	switch {
+	case claim.DeletionTimestamp != nil:
+		reason = "is being deleted"
+	case claim.Spec.VolumeMode != nil && *claim.Spec.VolumeMode == corev1.PersistentVolumeBlock:
+		reason = "is a raw block volume, not a filesystem"
+	case dgdrRunClaimIsReadWriteOncePodOnly(claim):
+		reason = "allows only ReadWriteOncePod access, so the Job cannot mount it beside its writer"
+	case claim.Status.Phase == corev1.ClaimLost:
+		reason = "has lost its PersistentVolume"
+	default:
+		return "", nil
+	}
+	return fmt.Sprintf("trace PersistentVolumeClaim %q in namespace %q %s", name, run.Namespace, reason), nil
+}
+
+// dgdrRunClaimIsReadWriteOncePodOnly reports whether the claim's only access mode is
+// ReadWriteOncePod, which its writer already holds.
+func dgdrRunClaimIsReadWriteOncePodOnly(claim *corev1.PersistentVolumeClaim) bool {
+	if len(claim.Spec.AccessModes) == 0 {
+		return false
+	}
+	for _, mode := range claim.Spec.AccessModes {
+		if mode != corev1.ReadWriteOncePod {
+			return false
+		}
+	}
+	return true
+}
+
+// failRunBeforeJob completes a Run that cannot start, without a Job. The Job-driven status machine
+// never runs for it, because Reconcile stops at Completed=True.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) failRunBeforeJob(
+	ctx context.Context,
+	run *nvidiacomv1beta2.DynamoGraphDeploymentRun,
+	reason, message string,
+) error {
+	original := run.DeepCopy()
+	run.Status.Phase = nvidiacomv1beta2.DGDRRunPhaseFailed
+	run.Status.CompletionTime = new(metav1.Now())
+	meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               nvidiacomv1beta2.DGDRRunConditionCompleted,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: run.Generation,
+	})
+	if err := r.Status().Patch(ctx, run, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("update Run %q status: %w", run.Name, err)
+	}
+	return nil
 }
 
 func (r *DynamoGraphDeploymentRunV1beta2Reconciler) reconcilePublisherAccess(
@@ -422,6 +518,16 @@ func dgdrRunInput(
 	for key, value := range reserved {
 		if err := unstructured.SetNestedField(input, value, "dgdr_run", key); err != nil {
 			return nil, fmt.Errorf("set operator-owned dgdr_run.%s: %w", key, err)
+		}
+	}
+
+	// The typed trace owns traffic.source.type, format and paths the same way. Restoring them keeps a
+	// Run created without Request admission reading only the file on its read-only mount.
+	if run.Spec.Workload != nil && run.Spec.Workload.Trace != nil {
+		for key, value := range aisimulate.TraceSource(run.Spec.Workload.Trace) {
+			if err := unstructured.SetNestedField(input, value, "traffic", "source", key); err != nil {
+				return nil, fmt.Errorf("set workload-owned traffic.source.%s: %w", key, err)
+			}
 		}
 	}
 	return input, nil
@@ -677,6 +783,26 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) buildJob(
 				},
 			},
 		},
+	}
+
+	// Only AISimulate reads the trace. The whole claim is mounted read-only without a subPath,
+	// which the kubelet would have to create, at the directory aisimulate.TracePath resolves under.
+	if run.Spec.Workload != nil && run.Spec.Workload.Trace != nil && run.Spec.Workload.Trace.Source.PVC != nil {
+		pod := &job.Spec.Template.Spec
+		pod.Volumes = append(pod.Volumes, corev1.Volume{
+			Name: dgdrRunTraceVolume,
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: run.Spec.Workload.Trace.Source.PVC.ClaimName,
+				ReadOnly:  true,
+			},
+		})
+		for i := range pod.Containers {
+			if pod.Containers[i].Name == dgdrRunSweeperContainer {
+				pod.Containers[i].VolumeMounts = append(pod.Containers[i].VolumeMounts, corev1.VolumeMount{
+					Name: dgdrRunTraceVolume, MountPath: aisimulate.TraceMountPath, ReadOnly: true,
+				})
+			}
+		}
 	}
 	return job
 }
