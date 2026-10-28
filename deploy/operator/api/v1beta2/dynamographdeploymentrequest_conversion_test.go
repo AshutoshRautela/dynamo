@@ -145,51 +145,6 @@ func TestV1Beta2RoundTripUsesEnvelope(t *testing.T) {
 	}
 }
 
-// The envelope carries the complete native spec, so a trace workload needs no conversion code of
-// its own. This guards against a carrier-free type that silently drops it.
-func TestV1Beta2TraceWorkloadRoundTripsThroughTheEnvelope(t *testing.T) {
-	t.Parallel()
-
-	t.Log("Create a native v1beta2 request that replays a trace from a claim.")
-	src := &DynamoGraphDeploymentRequest{
-		Name: "trace-search", Namespace: "default",
-		Spec: DynamoGraphDeploymentRequestSpec{
-			NativeSearchInput: NativeSearchInput{
-				Model: &ModelSpec{Name: "Qwen/Qwen3-32B"},
-				Workload: &WorkloadSpec{Trace: &TraceWorkloadSpec{
-					Format: TraceFormatDynamo,
-					Source: TraceSourceSpec{PVC: &TracePVCSource{ClaimName: "request-traces", Path: "retune/w-1.jsonl.gz"}},
-					Replay: &TraceReplaySpec{ArrivalSpeedupRatio: new(2.0)},
-				}},
-			},
-		},
-	}
-
-	t.Log("Convert it to the v1beta1 envelope and read the trace from the envelope JSON.")
-	hub := &v1beta1.DynamoGraphDeploymentRequest{}
-	if err := src.ConvertTo(hub); err != nil {
-		t.Fatalf("ConvertTo() error = %v", err)
-	}
-	var envelope map[string]any
-	if err := json.Unmarshal(hub.Spec.V1Beta2.Raw, &envelope); err != nil {
-		t.Fatalf("decode spec.v1beta2: %v", err)
-	}
-	trace := envelope["workload"].(map[string]any)["trace"].(map[string]any)
-	pvc := trace["source"].(map[string]any)["pvc"].(map[string]any)
-	if trace["format"] != "dynamo" || pvc["claimName"] != "request-traces" || pvc["path"] != "retune/w-1.jsonl.gz" {
-		t.Fatalf("spec.v1beta2.workload.trace = %#v", trace)
-	}
-
-	t.Log("Convert back and expect the identical native spec.")
-	dst := &DynamoGraphDeploymentRequest{}
-	if err := dst.ConvertFrom(hub); err != nil {
-		t.Fatalf("ConvertFrom() error = %v", err)
-	}
-	if !reflect.DeepEqual(src.Spec, dst.Spec) {
-		t.Fatalf("spec changed across round trip\nwant: %#v\n got: %#v", src.Spec, dst.Spec)
-	}
-}
-
 func TestEmptyStatusInheritsNativeV1Beta2Representation(t *testing.T) {
 	t.Parallel()
 

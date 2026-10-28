@@ -144,18 +144,24 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) Reconcile(
 
 	// A Job that can never mount its trace would keep the Run active forever, so a Run that has not
 	// created its Job checks the claim before anything is discovered or created for it. A recorded
-	// jobRef means the Job was created even if the cache does not show it yet; that Job keeps
-	// driving the Run, whatever happens to the claim later.
+	// jobRef, or a Job the API server already holds, means the Job was created even if the cache does
+	// not show it yet; that Job keeps driving the Run, whatever happens to the claim later.
+	resourceName := dgdrRunResourceName(run.Name)
 	if job == nil && run.Status.JobRef == nil {
 		unavailable, err := r.traceSourceUnavailable(ctx, run)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if unavailable != "" {
-			return ctrl.Result{}, r.failRunBeforeJob(ctx, run, dgdrRunReasonTraceSourceUnavailable, unavailable)
+			created, err := r.runJobExists(ctx, run, resourceName)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !created {
+				return ctrl.Result{}, r.failRunBeforeJob(ctx, run, dgdrRunReasonTraceSourceUnavailable, unavailable)
+			}
 		}
 	}
-	resourceName := dgdrRunResourceName(run.Name)
 	if err := r.reconcilePublisherAccess(ctx, run, resourceName); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -239,6 +245,26 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) traceSourceUnavailable(
 		return "", nil
 	}
 	return fmt.Sprintf("trace PersistentVolumeClaim %q in namespace %q %s", name, run.Namespace, reason), nil
+}
+
+// runJobExists reports whether the API server holds the Job this Run controls under name. Creating
+// the Job and recording its jobRef are separate writes, so a Job can exist while both the cache and
+// status.jobRef miss it. The Job is therefore read through the uncached API reader, and only right
+// before the Run would be failed terminally for its trace claim.
+func (r *DynamoGraphDeploymentRunV1beta2Reconciler) runJobExists(
+	ctx context.Context,
+	run *nvidiacomv1beta2.DynamoGraphDeploymentRun,
+	name string,
+) (bool, error) {
+	job := &batchv1.Job{}
+	err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, job)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get Job %q of Run %q: %w", name, run.Name, err)
+	}
+	return metav1.IsControlledBy(job, run), nil
 }
 
 // failRunBeforeJob completes a Run that cannot start, without a Job. The Job-driven status machine

@@ -904,8 +904,6 @@ func TestV1beta2RunControllerFailsARunWhoseTraceClaimCannotBeMounted(t *testing.
 	}
 }
 
-// assertNoDGDRRunResources fails when the Run controller created any Job, input ConfigMap or
-// publisher RBAC object in the default namespace.
 func assertNoDGDRRunResources(t *testing.T, c client.Client) {
 	t.Helper()
 	for _, list := range []client.ObjectList{
@@ -1005,6 +1003,50 @@ func TestV1beta2RunControllerKeepsFollowingAJobAfterItsTraceClaimDisappears(t *t
 	assertDGDRRunPendingStatus(t, f.run(), jobName)
 
 	t.Log("Once the cache shows the Job again, the Job still drives the Run")
+	f.reconciler.Client = cached
+	f.reconcile()
+	assertDGDRRunPendingStatus(t, f.run(), jobName)
+}
+
+func TestV1beta2RunControllerKeepsAJobWhoseJobRefWasNeverRecorded(t *testing.T) {
+	f := newDGDRRunFixture(t, &fixedRunHardware{info: gpu.GPUInfo{GPUsPerNode: 8}}, dgdrRunWithTraceForTest(t, map[string]any{}), traceClaimForTest())
+	cached := f.reconciler.Client
+
+	t.Log("Create the Job but fail the status patch that would record its jobRef")
+	f.reconciler.Client = interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+		SubResourcePatch: func(context.Context, client.Client, string, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
+			return errors.New("injected status patch failure")
+		},
+	})
+	if _, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.run())}); err == nil {
+		t.Fatal("reconcile error = nil, want the injected status patch failure")
+	}
+	jobName := f.job().Name
+	if f.run().Status.JobRef != nil {
+		t.Fatalf("jobRef = %+v, want none after the failed status patch", f.run().Status.JobRef)
+	}
+
+	t.Log("Delete the claim and hide the Job from the cached List")
+	if err := f.client.Delete(t.Context(), traceClaimForTest()); err != nil {
+		t.Fatalf("delete claim: %v", err)
+	}
+	f.reconciler.Client = interceptor.NewClient(f.client.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*batchv1.JobList); ok {
+				return nil
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+	_, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.run())})
+	if !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("reconcile error = %v, want the Job create to hit AlreadyExists instead of failing the Run", err)
+	}
+	if condition := meta.FindStatusCondition(f.run().Status.Conditions, nvidiacomv1beta2.DGDRRunConditionCompleted); condition != nil {
+		t.Fatalf("Completed condition = %+v, want none while the Job exists", condition)
+	}
+
+	t.Log("Once the cache shows the Job, the Job drives the Run")
 	f.reconciler.Client = cached
 	f.reconcile()
 	assertDGDRRunPendingStatus(t, f.run(), jobName)
