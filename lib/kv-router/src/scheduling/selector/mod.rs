@@ -32,7 +32,11 @@ use crate::plugins::worker_selection::{
     RuntimePolicyConfig, RuntimePolicyError, RuntimePolicyUpdate,
 };
 pub use policy::WorkerSelectionPolicy;
-use policy::{ComposedPolicyState, WorkerSelectionPolicyStateRef, collect_policy_candidates};
+pub(crate) use policy::{CandidatePreparer, PreparedCandidates};
+use policy::{
+    ComposedPolicyState, WorkerSelectionPolicyStateRef, collect_policy_candidates,
+    collect_prepared_candidates,
+};
 #[cfg(any(test, feature = "bench"))]
 use reference::pick_default_worker;
 
@@ -86,6 +90,26 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
         _trace: Option<SelectionTraceSpec>,
     ) -> Result<(WorkerSelectionResult, Option<SelectionTrace>), KvSchedulerError> {
         self.select_worker(input).map(|result| (result, None))
+    }
+
+    /// Builds candidate rows before the request reaches the scheduler actor, for
+    /// selectors whose rows depend only on the request and worker configuration
+    /// until load inputs are filled.
+    #[doc(hidden)]
+    fn candidate_preparer(&self) -> Option<CandidatePreparer> {
+        None
+    }
+
+    /// Like [`Self::select_worker_traced`], from rows that [`Self::candidate_preparer`]
+    /// built against the same worker configuration when given. The default ignores them.
+    #[doc(hidden)]
+    fn select_worker_prepared(
+        &self,
+        input: WorkerSelectionInput<'_, C>,
+        _prepared: Option<PreparedCandidates>,
+        trace: Option<SelectionTraceSpec>,
+    ) -> Result<(WorkerSelectionResult, Option<SelectionTrace>), KvSchedulerError> {
+        self.select_worker_traced(input, trace)
     }
 }
 
@@ -261,6 +285,23 @@ impl<'a> MaterializedSelectionInput<'a> {
         self.max_raw_cached_tokens.get()
     }
 
+    /// Adopt what preparation computed over the same rows, so the selected
+    /// worker's fetch source comes from the summary that scored every row.
+    fn restore_prepared(
+        &self,
+        max_raw_cached_tokens: Option<usize>,
+        kv_transfer_sources: Option<KvTransferSourceSummary>,
+    ) {
+        self.max_raw_cached_tokens.set(max_raw_cached_tokens);
+        if let Some(sources) = kv_transfer_sources {
+            let _ = self.kv_transfer_sources.set(sources);
+        }
+    }
+
+    fn into_kv_transfer_sources(self) -> Option<KvTransferSourceSummary> {
+        self.kv_transfer_sources.into_inner()
+    }
+
     /// Count a worker toward the best eligible cached prefix once every policy
     /// filter has kept it.
     fn track_kept_candidate(&self, worker: WorkerWithDpRank) {
@@ -301,11 +342,6 @@ impl<'a> MaterializedSelectionInput<'a> {
         } else {
             0
         };
-        let worker_load = if inputs.contains(WorkerInputs::LOAD) {
-            self.request.worker_loads.get(&worker).copied()
-        } else {
-            None
-        };
         let cache = if inputs.contains(WorkerInputs::CACHE) {
             let effective_overlap_blocks = self.request.effective_overlap_blocks_for(worker);
             let reported_device_overlap_blocks = self
@@ -344,14 +380,7 @@ impl<'a> MaterializedSelectionInput<'a> {
             WorkerCacheData::default()
         };
         let load = if inputs.contains(WorkerInputs::LOAD) {
-            let available = worker_load.is_some();
-            let worker_load = worker_load.unwrap_or_else(|| self.request.worker_load_for(worker));
-            WorkerLoadInput {
-                available,
-                active_prefill_tokens: worker_load.active_prefill_tokens,
-                decode_cost_blocks: worker_load.potential_decode_blocks() as f64,
-                active_requests: worker_load.active_requests,
-            }
+            self.load_input(worker)
         } else {
             WorkerLoadInput::default()
         };
@@ -363,6 +392,19 @@ impl<'a> MaterializedSelectionInput<'a> {
             load,
             transfer: None,
             preferred_taint_multiplier,
+        }
+    }
+
+    #[inline(always)]
+    fn load_input(&self, worker: WorkerWithDpRank) -> WorkerLoadInput {
+        let worker_load = self.request.worker_loads.get(&worker).copied();
+        let available = worker_load.is_some();
+        let worker_load = worker_load.unwrap_or_else(|| self.request.worker_load_for(worker));
+        WorkerLoadInput {
+            available,
+            active_prefill_tokens: worker_load.active_prefill_tokens,
+            decode_cost_blocks: worker_load.potential_decode_blocks() as f64,
+            active_requests: worker_load.active_requests,
         }
     }
 }
@@ -535,6 +577,7 @@ fn log_selection<C: WorkerConfigLike>(
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 // DefaultWorkerSelector and SelectionService both converge here. Only the scorer/picker stage is
 // dispatched; eligibility outcomes and result construction stay host-owned and shared.
 fn select_worker_with_policy<C: WorkerConfigLike>(
@@ -545,6 +588,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
     eligibility: RoutingEligibility<'_>,
     block_size: u32,
     trace: Option<SelectionTraceSpec>,
+    prepared: Option<PreparedCandidates>,
 ) -> Result<(WorkerSelectionResult, Option<SelectionTrace>), KvSchedulerError> {
     eligibility.validate_pinned_worker_allowed()?;
 
@@ -574,8 +618,12 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
         }
         WorkerSelectionPolicyStateRef::Composed(state) => {
             let mut state = state.borrow_mut();
-            let has_eligible_worker =
-                collect_policy_candidates(&mut state, &input, workers, request, eligibility)?;
+            let has_eligible_worker = match prepared.filter(|prepared| prepared.matches(&state)) {
+                Some(prepared) => collect_prepared_candidates(&mut state, &input, prepared)?,
+                None => {
+                    collect_policy_candidates(&mut state, &input, workers, request, eligibility)?
+                }
+            };
             let ComposedPolicyState {
                 picker,
                 picker_inputs,

@@ -658,6 +658,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             eligibility,
             block_size,
             None,
+            None,
         )
         .map(|(result, _)| result)
     }

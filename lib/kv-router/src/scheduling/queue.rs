@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOr
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -26,7 +27,9 @@ use super::policy_queue::{PolicyQueue, QueueMetadata, QueueSnapshot};
 use super::prefill_load::{PrefillLoadEstimator, effective_prefill_tokens};
 use super::queue_admission::WorkerPlacement;
 use super::request_classifier::{ClassificationOverrides, ClassifyRequest};
-use super::selector::{WorkerSelectionInput, WorkerSelector};
+use super::selector::{
+    CandidatePreparer, PreparedCandidates, WorkerSelectionInput, WorkerSelector,
+};
 use super::types::{
     AdvisorySchedulingResponse, AdvisoryWorkerLoad, AttemptId, KvSchedulerError,
     NonMaxOverlapSelection, NonMaxOverlapSelectionObserver, OverloadedWorkerProvider,
@@ -77,6 +80,42 @@ struct QueuedRequest {
     enqueue_at: Instant,
     due_at: Option<Instant>,
     block_hashes: Option<Vec<LocalBlockHash>>,
+    prepared: Option<Box<PreparedAdmission>>,
+    /// Actor turn that received the request. Prepared rows are used only in that turn.
+    enqueue_turn: u64,
+}
+
+/// Candidate rows built on the caller task, before the request reaches the actor.
+///
+/// Rows depend only on the request, the worker configuration, and the overload and
+/// availability providers. The actor's bookings change only load inputs, which it
+/// fills at selection, so each admission still observes every earlier booking.
+struct PreparedAdmission {
+    candidates: PreparedCandidates,
+    /// Configuration generation, loaded before the configuration was read.
+    workers_generation: u64,
+}
+
+/// Eligibility for one selection: caller constraints, hard availability,
+/// transient overload, and an eligible exclusive affinity target.
+fn selection_eligibility<'a, C: WorkerConfigLike>(
+    request: &'a SchedulingRequest,
+    workers: &HashMap<WorkerId, C>,
+    overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
+    available_worker_ids: Option<&'a HashSet<WorkerId>>,
+    exclusive_affinity: bool,
+) -> RoutingEligibility<'a> {
+    let eligibility = request
+        .eligibility_with_overloaded(overloaded_worker_ids)
+        .with_available_workers(available_worker_ids);
+    match request.affinity_target {
+        Some(target)
+            if exclusive_affinity && eligibility.affinity_target_is_eligible(workers, target) =>
+        {
+            eligibility.with_affinity_target(target)
+        }
+        _ => eligibility,
+    }
 }
 
 struct SelectedWorkerForRequest {
@@ -135,6 +174,7 @@ enum AdmissionCommand {
         request: SchedulingRequest,
         attempt_tx: Option<oneshot::Sender<AttemptId>>,
         block_hashes: Option<Vec<LocalBlockHash>>,
+        prepared: Option<Box<PreparedAdmission>>,
         queue_metadata: QueueMetadata,
         lease: Option<Box<RequestLifecycleLease>>,
         ack_tx: oneshot::Sender<Option<Box<RequestLifecycleLease>>>,
@@ -507,6 +547,14 @@ struct SchedulerQueueActor<
     class_counters: Arc<Vec<ClassQueueCounters>>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
+    /// Advanced when the actor observes a configuration change; see `PreparedAdmission`.
+    workers_generation: Arc<AtomicU64>,
+    /// The configuration channel closed and its final value has been counted.
+    workers_closed: bool,
+    /// Current preparer, republished after a runtime policy update.
+    candidate_preparer: Arc<ArcSwapOption<CandidatePreparer>>,
+    /// One per command or wakeup. A request enqueued in an earlier turn rebuilds its rows.
+    turn: u64,
     projected_loads: FxHashMap<WorkerWithDpRank, WorkerLoadProjection>,
     block_size: u32,
     selector: Sel,
@@ -543,9 +591,14 @@ pub struct SchedulerQueue<
     pending_isl_tokens: Arc<AtomicUsize>,
     class_counters: Arc<Vec<ClassQueueCounters>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
+    workers_generation: Arc<AtomicU64>,
+    candidate_preparer: Arc<ArcSwapOption<CandidatePreparer>>,
+    exclusive_affinity: bool,
+    block_size: u32,
     profile: PolicyProfile,
     start_time: Instant,
     available_worker_provider: Option<WorkerAvailabilityProvider>,
+    overloaded_worker_provider: Option<OverloadedWorkerProvider>,
     supports_overlap_refresh: bool,
     non_max_overlap_selection_observer: Arc<OnceLock<NonMaxOverlapSelectionObserver>>,
     /// Per-candidate cost capture for admitted selections, installed once by the host.
@@ -673,6 +726,11 @@ impl<
                 Ok(())
             })
         };
+        let workers_generation = Arc::new(AtomicU64::new(0));
+        let candidate_preparer = Arc::new(ArcSwapOption::from(
+            selector.candidate_preparer().map(Arc::new),
+        ));
+        let exclusive_affinity = selector.uses_exclusive_affinity_target();
         let actor = SchedulerQueueActor {
             pending,
             cleanup: Arc::clone(&cleanup),
@@ -684,13 +742,17 @@ impl<
             class_counters: Arc::clone(&class_counters),
             slots,
             workers_with_configs: workers_with_configs.clone(),
+            workers_generation: Arc::clone(&workers_generation),
+            workers_closed: false,
+            candidate_preparer: Arc::clone(&candidate_preparer),
+            turn: 0,
             projected_loads: FxHashMap::default(),
             block_size,
             selector,
             prefill_load_estimator,
             overlap_scores_refresh,
             overlap_refresh_after,
-            overloaded_worker_provider,
+            overloaded_worker_provider: overloaded_worker_provider.clone(),
             available_worker_provider: available_worker_provider.clone(),
             non_max_overlap_selection_observer: Arc::clone(&non_max_overlap_selection_observer),
             selection_trace: Arc::clone(&selection_trace),
@@ -706,9 +768,14 @@ impl<
             pending_isl_tokens,
             class_counters,
             workers_with_configs,
+            workers_generation,
+            candidate_preparer,
+            exclusive_affinity,
+            block_size,
             profile,
             start_time,
             available_worker_provider,
+            overloaded_worker_provider,
             supports_overlap_refresh: overlap_refresh_after.is_some(),
             non_max_overlap_selection_observer,
             selection_trace,
@@ -821,11 +888,13 @@ impl<
             return None;
         }
 
+        let prepared = self.prepare_candidates(&request);
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AdmissionCommand::Enqueue {
             request,
             attempt_tx,
             block_hashes: self.prepare_block_hashes_for_refresh(block_hashes),
+            prepared,
             queue_metadata,
             lease,
             ack_tx,
@@ -895,6 +964,7 @@ impl<
             request,
             attempt_tx: None,
             block_hashes: None,
+            prepared: None,
             queue_metadata,
             lease: None,
             ack_tx,
@@ -1112,6 +1182,44 @@ impl<
         })
     }
 
+    /// Build candidate rows on the caller task, leaving the actor only the
+    /// load inputs that depend on its bookings.
+    fn prepare_candidates(&self, request: &SchedulingRequest) -> Option<Box<PreparedAdmission>> {
+        if request.pinned_worker.is_some() {
+            return None;
+        }
+        let preparer = self.candidate_preparer.load().as_deref().copied()?;
+        // Load before reading the configuration: a change after this load
+        // advances the generation before the actor selects with these rows.
+        let workers_generation = self.workers_generation.load(AtomicOrdering::Acquire);
+        let available_worker_ids = self
+            .available_worker_provider
+            .as_ref()
+            .and_then(|provider| provider(request));
+        let overloaded_worker_ids = self
+            .overloaded_worker_provider
+            .as_ref()
+            .and_then(|provider| provider());
+        let workers = self.workers_with_configs.borrow();
+        let eligibility = selection_eligibility(
+            request,
+            &workers,
+            overloaded_worker_ids.as_ref(),
+            available_worker_ids.as_deref(),
+            self.exclusive_affinity,
+        );
+        let candidates = preparer.prepare(WorkerSelectionInput::configured(
+            &workers,
+            request,
+            eligibility,
+            self.block_size,
+        ))?;
+        Some(Box::new(PreparedAdmission {
+            candidates,
+            workers_generation,
+        }))
+    }
+
     fn prepare_block_hashes_for_refresh(
         &self,
         block_hashes: Option<Vec<LocalBlockHash>>,
@@ -1134,6 +1242,7 @@ impl<
         let mut commands_since_cleanup = 0usize;
         let capacity_updates = self.capacity_updates.clone();
         loop {
+            self.turn = self.turn.wrapping_add(1);
             let due_at = self.pending.next_due_at();
             let command = if capacity_updates.is_none() && due_at.is_none() {
                 rx.recv().await
@@ -1173,6 +1282,7 @@ impl<
                     request,
                     attempt_tx,
                     block_hashes,
+                    prepared,
                     queue_metadata,
                     lease,
                     ack_tx,
@@ -1185,6 +1295,7 @@ impl<
                         attempt_tx,
                         lifecycle_transfer,
                         block_hashes,
+                        prepared,
                         queue_metadata,
                     );
                     let cleanup_ready = drain_cleanup && self.drain_cleanup();
@@ -1206,7 +1317,15 @@ impl<
                     // A cancelled or timed-out caller must not leave a queued mutation behind.
                     if !response.is_closed() {
                         let result = match update {
-                            Some(update) => self.selector.update_runtime_config(update),
+                            Some(update) => {
+                                let result = self.selector.update_runtime_config(update);
+                                if result.is_ok() {
+                                    // A replacement may need fewer inputs; prepare what it reads.
+                                    self.candidate_preparer
+                                        .store(self.selector.candidate_preparer().map(Arc::new));
+                                }
+                                result
+                            }
                             None => self.selector.runtime_config(),
                         };
                         let _ = response.send(result);
@@ -1258,6 +1377,7 @@ impl<
         attempt_tx: Option<oneshot::Sender<AttemptId>>,
         lifecycle_transfer: Option<Arc<AdmissionLifecycleTransfer>>,
         block_hashes: Option<Vec<LocalBlockHash>>,
+        prepared: Option<Box<PreparedAdmission>>,
         queue_metadata: QueueMetadata,
     ) -> bool {
         let class_index = queue_metadata.class_index;
@@ -1278,7 +1398,7 @@ impl<
         // `queue_rejection` would reject with `limit: 0`. Admit directly instead
         // so selection reports the real condition, `NoEndpoints`.
         if self.workers_with_configs.borrow().is_empty() {
-            return self.admit_one(request, attempt_tx, lifecycle_transfer, decay_now);
+            return self.admit_one(request, attempt_tx, lifecycle_transfer, decay_now, prepared);
         }
         // A class with any zero per-worker limit never queues: keep the direct
         // admission semantics by admitting while a worker has prefill capacity,
@@ -1303,7 +1423,13 @@ impl<
                     )
                 });
             if !should_queue {
-                return self.admit_one(request, attempt_tx, lifecycle_transfer, decay_now);
+                return self.admit_one(
+                    request,
+                    attempt_tx,
+                    lifecycle_transfer,
+                    decay_now,
+                    prepared,
+                );
             }
         }
         tracing::trace!(policy_class = class.name, "ordering request");
@@ -1319,6 +1445,8 @@ impl<
             enqueue_at: decay_now,
             due_at: queue_metadata.due_at,
             block_hashes,
+            prepared,
+            enqueue_turn: self.turn,
         };
         let worker_count = self.workers_with_configs.borrow().len();
         if let Err((rejection, queued)) = self.pending.enqueue_with_due_at(
@@ -1633,6 +1761,9 @@ impl<
                 continue;
             }
             let wait_ms = queued.enqueue_at.elapsed().as_millis() as u64;
+            // Rows prepared before the request waited may be stale: overload and
+            // availability can change while it waits, and a refresh replaces its overlap.
+            let prepared_is_current = queued.enqueue_turn == self.turn && refreshed.is_none();
             if let Some(snapshot) = refreshed {
                 tracing::info!(
                     request_id = queued.request.mode.request_id().unwrap_or("unknown"),
@@ -1659,6 +1790,7 @@ impl<
                 queued.attempt_tx,
                 queued.lifecycle_transfer,
                 admit_now,
+                queued.prepared.filter(|_| prepared_is_current),
             );
         }
     }
@@ -1688,6 +1820,7 @@ impl<
         &self,
         request: &SchedulingRequest,
         admitted: bool,
+        prepared: Option<PreparedCandidates>,
     ) -> Result<SelectedWorkerForRequest, KvSchedulerError> {
         let available_worker_ids = self
             .available_worker_provider
@@ -1700,28 +1833,27 @@ impl<
                 .overloaded_worker_provider
                 .as_ref()
                 .and_then(|provider| provider());
-            let mut eligibility = request
-                .eligibility_with_overloaded(overloaded_worker_ids.as_ref())
-                .with_available_workers(available_worker_ids.as_deref());
-            if self.selector.uses_exclusive_affinity_target()
-                && let Some(target) = request.affinity_target
-                && eligibility.affinity_target_is_eligible(&workers, target)
-            {
-                eligibility = eligibility.with_affinity_target(target);
-            }
+            let eligibility = selection_eligibility(
+                request,
+                &workers,
+                overloaded_worker_ids.as_ref(),
+                available_worker_ids.as_deref(),
+                self.selector.uses_exclusive_affinity_target(),
+            );
             let trace = if admitted {
                 self.selection_trace.get().copied()
             } else {
                 None
             };
             self.selector
-                .select_worker_traced(
+                .select_worker_prepared(
                     WorkerSelectionInput::configured(
                         &workers,
                         request,
                         eligibility,
                         self.block_size,
                     ),
+                    prepared,
                     trace,
                 )
                 .map(|(selection, selection_trace)| {
@@ -1773,7 +1905,7 @@ impl<
         decay_now: Instant,
     ) -> Result<AdvisorySchedulingResponse, KvSchedulerError> {
         self.with_projected_loads(request, decay_now, |actor, request| {
-            let selected = actor.select_worker_for_request(request, false)?;
+            let selected = actor.select_worker_for_request(request, false, None)?;
 
             Ok(AdvisorySchedulingResponse {
                 selected_worker_load: selected.selected_worker_load,
@@ -1801,10 +1933,34 @@ impl<
         attempt_tx: Option<oneshot::Sender<AttemptId>>,
         lifecycle_transfer: Option<Arc<AdmissionLifecycleTransfer>>,
         decay_now: Instant,
+        prepared: Option<Box<PreparedAdmission>>,
     ) -> bool {
+        let prepared = prepared.and_then(|prepared| {
+            (prepared.workers_generation == self.workers_generation())
+                .then_some(prepared.candidates)
+        });
         self.with_projected_loads(request, decay_now, |actor, request| {
-            actor.admit_one_projected(request, attempt_tx, lifecycle_transfer)
+            actor.admit_one_projected(request, attempt_tx, lifecycle_transfer, prepared)
         })
+    }
+
+    /// Generation of the configuration the actor selects against. Observing a
+    /// change advances it, so rows prepared against an earlier one are rebuilt.
+    fn workers_generation(&mut self) -> u64 {
+        let changed = match self.workers_with_configs.has_changed() {
+            Ok(changed) => changed,
+            // A closed channel cannot report its last change, but holds its
+            // final configuration from then on, so count the close once.
+            Err(_) => !std::mem::replace(&mut self.workers_closed, true),
+        };
+        if changed {
+            self.workers_with_configs.mark_unchanged();
+            return self
+                .workers_generation
+                .fetch_add(1, AtomicOrdering::Release)
+                .wrapping_add(1);
+        }
+        self.workers_generation.load(AtomicOrdering::Relaxed)
     }
 
     fn admit_one_projected(
@@ -1812,8 +1968,9 @@ impl<
         request: &mut SchedulingRequest,
         attempt_tx: Option<oneshot::Sender<AttemptId>>,
         lifecycle_transfer: Option<Arc<AdmissionLifecycleTransfer>>,
+        prepared: Option<PreparedCandidates>,
     ) -> bool {
-        let selected = match self.select_worker_for_request(request, true) {
+        let selected = match self.select_worker_for_request(request, true, prepared) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("scheduling failed: {e}");
@@ -3088,6 +3245,7 @@ policy_classes:
                 request,
                 attempt_tx: None,
                 block_hashes: Some(vec![LocalBlockHash(42)]),
+                prepared: None,
                 queue_metadata,
                 lease: None,
                 ack_tx,
@@ -3482,6 +3640,10 @@ policy_classes:
             class_counters: Arc::clone(&queue.class_counters),
             slots: Arc::clone(slots),
             workers_with_configs: queue.workers_with_configs.clone(),
+            workers_generation: Arc::clone(&queue.workers_generation),
+            workers_closed: false,
+            candidate_preparer: Arc::clone(&queue.candidate_preparer),
+            turn: 0,
             projected_loads: FxHashMap::with_capacity_and_hasher(8, Default::default()),
             block_size: 16,
             selector: DefaultWorkerSelector::new(None, "test"),
@@ -3497,6 +3659,225 @@ policy_classes:
         }
     }
 
+    /// Delegates to a composed policy and counts selections from prepared rows.
+    struct CountingPreparedPolicy {
+        inner: crate::WorkerSelectionPolicy,
+        prepared_selections: Arc<AtomicUsize>,
+    }
+
+    impl WorkerSelector<SimpleWorkerConfig> for CountingPreparedPolicy {
+        fn required_worker_inputs(&self) -> WorkerInputs {
+            WorkerSelector::<SimpleWorkerConfig>::required_worker_inputs(&self.inner)
+        }
+
+        fn select_worker(
+            &self,
+            input: WorkerSelectionInput<'_, SimpleWorkerConfig>,
+        ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+            self.inner.select_worker(input)
+        }
+
+        fn candidate_preparer(&self) -> Option<CandidatePreparer> {
+            WorkerSelector::<SimpleWorkerConfig>::candidate_preparer(&self.inner)
+        }
+
+        fn select_worker_prepared(
+            &self,
+            input: WorkerSelectionInput<'_, SimpleWorkerConfig>,
+            prepared: Option<PreparedCandidates>,
+            trace: Option<SelectionTraceSpec>,
+        ) -> Result<(WorkerSelectionResult, Option<SelectionTrace>), KvSchedulerError> {
+            if prepared.is_some() {
+                self.prepared_selections.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.select_worker_prepared(input, prepared, trace)
+        }
+    }
+
+    /// Costs each worker by its load; ties go to the lowest worker.
+    struct LeastLoaded;
+
+    impl crate::WorkerScorer for LeastLoaded {
+        fn required_worker_inputs(&self) -> WorkerInputs {
+            WorkerInputs::LOAD
+        }
+
+        fn score(
+            &mut self,
+            _context: &crate::WorkerSelectionContext<'_>,
+            candidates: crate::WorkerCandidates<'_>,
+            costs: &mut [f64],
+        ) -> Result<(), crate::WorkerSelectionPolicyError> {
+            for (candidate, cost) in candidates.iter().zip(costs) {
+                let load = candidate.load().unwrap();
+                *cost = load.active_requests() as f64
+                    + load.active_prefill_tokens() as f64
+                    + load.decode_cost_blocks();
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::WorkerPicker for LeastLoaded {
+        fn pick(
+            &mut self,
+            _context: &crate::WorkerSelectionContext<'_>,
+            input: crate::WorkerInputView<'_>,
+        ) -> Result<usize, crate::WorkerSelectionPolicyError> {
+            let candidates = input.candidates();
+            Ok((0..candidates.len())
+                .min_by(|&a, &b| {
+                    candidates[a]
+                        .cost()
+                        .total_cmp(&candidates[b].cost())
+                        .then(candidates[a].worker().cmp(&candidates[b].worker()))
+                })
+                .unwrap())
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn make_prepared_queue(
+        num_workers: u64,
+        threshold_frac: Option<f64>,
+        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+    ) -> (
+        Arc<SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig, CountingPreparedPolicy>>,
+        Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>>,
+        watch::Sender<HashMap<u64, SimpleWorkerConfig>>,
+        Arc<AtomicUsize>,
+    ) {
+        let slots = Arc::new(ActiveSequencesMultiWorker::new(
+            NoopSequencePublisher,
+            16,
+            (0..num_workers).map(|id| (id, (0, 1))).collect(),
+            false,
+            0,
+            "test",
+        ));
+        let configs = (0..num_workers)
+            .map(|id| {
+                let config = SimpleWorkerConfig {
+                    max_num_batched_tokens: Some(64),
+                    ..Default::default()
+                };
+                (id, config)
+            })
+            .collect();
+        let (cfg_tx, cfg_rx) = watch::channel(configs);
+        let prepared_selections = Arc::new(AtomicUsize::new(0));
+        let selector = CountingPreparedPolicy {
+            inner: crate::WorkerSelectionPolicy::new(
+                crate::KvRouterConfig::default(),
+                "test",
+                vec![Box::new(LeastLoaded)],
+                Box::new(LeastLoaded),
+            ),
+            prepared_selections: Arc::clone(&prepared_selections),
+        };
+        let queue = Arc::new(SchedulerQueue::new(
+            Arc::clone(&slots),
+            cfg_rx,
+            PolicyProfile::synthetic(threshold_frac, RouterQueuePolicy::Fcfs),
+            16,
+            selector,
+            None,
+            None,
+            overloaded_worker_provider,
+            None,
+        ));
+        (queue, slots, cfg_tx, prepared_selections)
+    }
+
+    /// Enqueue with rows prepared earlier, as if the caller were slow to send.
+    async fn enqueue_prepared(
+        queue: &SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig, CountingPreparedPolicy>,
+        request: SchedulingRequest,
+        prepared: Option<Box<PreparedAdmission>>,
+    ) {
+        let queue_metadata = queue.default_queue_metadata(&request, Instant::now());
+        let (ack_tx, ack_rx) = oneshot::channel();
+        queue
+            .admission_tx
+            .send(AdmissionCommand::Enqueue {
+                request,
+                attempt_tx: None,
+                block_hashes: None,
+                prepared,
+                queue_metadata,
+                lease: None,
+                ack_tx,
+            })
+            .await
+            .unwrap();
+        ack_rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_rows_see_bookings_made_after_preparation() {
+        let (queue, _slots, _cfg_tx, prepared_selections) = make_prepared_queue(2, None, None);
+        let (later, later_rx) = make_request("later", 64);
+        let prepared = queue.prepare_candidates(&later);
+        assert!(prepared.is_some());
+
+        let (earlier, earlier_rx) = make_request("earlier", 64);
+        queue.enqueue(earlier).await;
+        let earlier = earlier_rx.await.unwrap().unwrap().best_worker;
+        assert_eq!(earlier, WorkerWithDpRank::new(0, 0));
+
+        // Load inputs are read at selection, so the earlier booking moves this request.
+        enqueue_prepared(&queue, later, prepared).await;
+        let later = later_rx.await.unwrap().unwrap().best_worker;
+        assert_eq!(later, WorkerWithDpRank::new(1, 0));
+        assert_eq!(prepared_selections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn prepared_rows_are_rebuilt_after_worker_config_change() {
+        let (queue, _slots, cfg_tx, prepared_selections) = make_prepared_queue(2, None, None);
+        let (request, rx) = make_request("request", 64);
+        let prepared = queue.prepare_candidates(&request);
+        // Worker 0 wins on the prepared rows, but it has left the configuration.
+        cfg_tx.send_modify(|configs| {
+            configs.remove(&0);
+        });
+
+        enqueue_prepared(&queue, request, prepared).await;
+        let selected = rx.await.unwrap().unwrap().best_worker;
+        assert_eq!(selected, WorkerWithDpRank::new(1, 0));
+        assert_eq!(prepared_selections.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn parked_request_rebuilds_prepared_rows() {
+        let overloaded = Arc::new(StdMutex::new(None::<HashSet<WorkerId>>));
+        let provider: OverloadedWorkerProvider = {
+            let overloaded = Arc::clone(&overloaded);
+            Arc::new(move || overloaded.lock().unwrap().clone())
+        };
+        let (queue, slots, _cfg_tx, prepared_selections) =
+            make_prepared_queue(2, Some(0.0), Some(provider));
+        for (id, worker) in [("first", 0), ("second", 1)] {
+            let (request, rx) = make_request(id, 64);
+            queue.enqueue(request).await;
+            let selected = rx.await.unwrap().unwrap().best_worker;
+            assert_eq!(selected, WorkerWithDpRank::new(worker, 0));
+        }
+        let (parked, mut parked_rx) = make_request("parked", 64);
+        queue.enqueue(parked).await;
+        assert!(parked_rx.try_recv().is_err());
+
+        // Worker 0 frees up while the request waits, but becomes overloaded.
+        *overloaded.lock().unwrap() = Some(HashSet::from([0]));
+        slots.free(&"first".to_owned(), Instant::now()).unwrap();
+        queue.capacity_changed(Some(WorkerWithDpRank::new(0, 0)));
+        queue.update().await;
+
+        let selected = parked_rx.await.unwrap().unwrap().best_worker;
+        assert_eq!(selected, WorkerWithDpRank::new(1, 0));
+        assert_eq!(prepared_selections.load(Ordering::Relaxed), 2);
+    }
+
     #[tokio::test]
     async fn enqueue_rechecks_capacity_before_later_shared_admission() {
         for overflow in [false, true] {
@@ -3508,14 +3889,14 @@ policy_classes:
 
             let (active, mut active_rx) = make_request("active", 64);
             let metadata = queue.default_queue_metadata(&active, Instant::now());
-            assert!(actor.handle_enqueue(active, None, None, None, metadata));
+            assert!(actor.handle_enqueue(active, None, None, None, None, metadata));
             actor.handle_enqueued().await;
             assert_eq!(active_rx.try_recv().unwrap().unwrap().best_worker, worker);
 
             let (mut older, mut older_rx) = make_request("older-pinned", 64);
             older.pinned_worker = Some(worker);
             let metadata = queue.default_queue_metadata(&older, Instant::now());
-            assert!(actor.handle_enqueue(older, None, None, None, metadata));
+            assert!(actor.handle_enqueue(older, None, None, None, None, metadata));
             actor.handle_enqueued().await;
             assert!(older_rx.try_recv().is_err());
 
@@ -3525,7 +3906,7 @@ policy_classes:
             }
             let (later, mut later_rx) = make_request("later-shared", 64);
             let metadata = queue.default_queue_metadata(&later, Instant::now());
-            assert!(actor.handle_enqueue(later, None, None, None, metadata));
+            assert!(actor.handle_enqueue(later, None, None, None, None, metadata));
             // Force enqueue processing before the capacity select branch.
             actor.handle_enqueued().await;
             assert_eq!(older_rx.try_recv().unwrap().unwrap().best_worker, worker);
@@ -3629,7 +4010,10 @@ policy_classes:
                 assert_eq!(request.worker_loads, expected);
                 assert!(!request.worker_loads.contains_key(&stale));
                 let storage = request.worker_loads.get(&worker).unwrap() as *const _;
-                assert_eq!(actor.admit_one_projected(request, None, None), succeeds);
+                assert_eq!(
+                    actor.admit_one_projected(request, None, None, None),
+                    succeeds
+                );
                 assert_eq!(rx.try_recv().unwrap().is_ok(), succeeds);
                 assert_eq!(request.worker_loads, expected);
                 storage
