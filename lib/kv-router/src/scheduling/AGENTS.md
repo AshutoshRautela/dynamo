@@ -41,9 +41,11 @@ sequenceDiagram
   sending the Enqueue command.
 - For a selector with a `candidate_preparer`, the handle also builds the candidate
   rows on the caller task: eligibility plus cache, preferred-taint, and fetch inputs.
-  The actor fills only load inputs, which depend on its earlier bookings. It rebuilds
-  the rows when the worker configuration changed since preparation or when the
-  request waited past the actor turn that received it.
+  The actor fills only load inputs, which depend on its earlier bookings. It uses the
+  rows only when it would build the same ones: the worker configuration, availability,
+  and overload it reads at selection match preparation, and the request is admitted in
+  the actor turn that received it. Otherwise it rebuilds them, and rows for a request
+  that stays queued are dropped when that turn ends.
 - `SchedulerQueueActor` routes every request through the policy queue and drains the
   ready backlog in the same actor turn, so freed capacity can go to another class's
   queued head under DRR rather than to the arriving request. The direct path remains

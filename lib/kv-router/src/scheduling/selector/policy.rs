@@ -339,16 +339,12 @@ pub struct PreparedCandidates {
 }
 
 impl CandidatePreparer {
-    /// Returns `None` for a pinned request, which has a single row, and when no
-    /// rank is eligible, so that selection reports why.
+    /// Returns `None` when no rank is eligible, so that selection reports why.
     pub(crate) fn prepare<C: WorkerConfigLike>(
         &self,
         input: WorkerSelectionInput<'_, C>,
     ) -> Option<PreparedCandidates> {
         let (workers, request, eligibility, block_size) = input.into_configured().ok()?;
-        if eligibility.pinned_worker().is_some() {
-            return None;
-        }
         let input = MaterializedSelectionInput::new(request, block_size);
         let row_inputs = self.inputs.without(WorkerInputs::LOAD);
         let materialize_preferred_taint = self.inputs.contains(WorkerInputs::PREFERRED_TAINT);
@@ -644,7 +640,6 @@ impl WorkerSelectionPolicy {
         trace: Option<SelectionTraceSpec>,
         prepared: Option<PreparedCandidates>,
     ) -> Result<(WorkerSelectionResult, Option<SelectionTrace>), KvSchedulerError> {
-        let (workers, request, eligibility, block_size) = input.into_configured()?;
         let state = match &self.state {
             #[cfg(any(test, feature = "bench"))]
             WorkerSelectionPolicyState::Reference(config, picker) => {
@@ -654,16 +649,7 @@ impl WorkerSelectionPolicy {
                 WorkerSelectionPolicyStateRef::Composed(state)
             }
         };
-        select_worker_with_policy(
-            self.worker_label,
-            state,
-            workers,
-            request,
-            eligibility,
-            block_size,
-            trace,
-            prepared,
-        )
+        select_worker_with_policy(self.worker_label, state, input, trace, prepared)
     }
 }
 
