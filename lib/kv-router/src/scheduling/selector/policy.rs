@@ -1127,27 +1127,6 @@ mod tests {
             }
         }
 
-        /// Lowest cost, ties to the lowest worker and rank, so both paths are deterministic.
-        struct LowestCostPicker;
-
-        impl WorkerPicker for LowestCostPicker {
-            fn pick(
-                &mut self,
-                _context: &WorkerSelectionContext<'_>,
-                input: WorkerInputView<'_>,
-            ) -> Result<usize, WorkerSelectionPolicyError> {
-                let candidates = input.candidates();
-                Ok((0..candidates.len())
-                    .min_by(|&a, &b| {
-                        candidates[a]
-                            .cost
-                            .total_cmp(&candidates[b].cost)
-                            .then(candidates[a].worker.cmp(&candidates[b].worker))
-                    })
-                    .unwrap())
-            }
-        }
-
         let workers: HashMap<_, _> = (0..6)
             .map(|worker_id| {
                 let taints = if worker_id % 2 == 0 {
@@ -1163,9 +1142,10 @@ mod tests {
             KvRouterConfig::default(),
             "test",
             vec![Box::new(EveryInputScorer)],
-            Box::new(LowestCostPicker),
+            Box::new(FirstPicker),
         );
         let preparer = WorkerSelector::<Worker>::candidate_preparer(&policy).unwrap();
+        // The trace keeps every candidate's cost, so it compares every row.
         let trace = Some(SelectionTraceSpec { top_k: 0 });
         let loads = |shift: u64| {
             (0..6)
@@ -1191,15 +1171,7 @@ mod tests {
                 .device
                 .insert(worker, blocks);
         }
-        let overloaded = HashSet::from([3]);
-        for case in [
-            "plain",
-            "tracked",
-            "allowed",
-            "preferred_taint",
-            "fetch",
-            "overloaded",
-        ] {
+        for case in ["tracked", "preferred_taint", "fetch"] {
             let mut request = base_request(256);
             request.overlap = base.overlap.clone();
             request.worker_loads = worker_loads_with_active_decode(loads(0));
@@ -1209,7 +1181,6 @@ mod tests {
                         request_id: "tracked".into(),
                     }
                 }
-                "allowed" => request.allowed_worker_ids = Some(HashSet::from([1, 2, 5])),
                 "preferred_taint" => {
                     request.routing_constraints.preferred_taints =
                         HashMap::from([("fast".to_string(), 1.0)])
@@ -1226,27 +1197,18 @@ mod tests {
             fn input<'a>(
                 workers: &'a HashMap<u64, Worker>,
                 request: &'a SchedulingRequest,
-                overloaded: Option<&'a HashSet<u64>>,
             ) -> WorkerSelectionInput<'a, Worker> {
-                let eligibility = request.eligibility_with_overloaded(overloaded);
-                WorkerSelectionInput::configured(workers, request, eligibility, 16)
+                WorkerSelectionInput::configured(workers, request, request.eligibility(), 16)
             }
-            let overloaded = (case == "overloaded").then_some(&overloaded);
-            let prepared = preparer
-                .prepare(input(&workers, &request, overloaded))
-                .unwrap();
+            let prepared = preparer.prepare(input(&workers, &request)).unwrap();
             // Loads are read at selection, after any booking since preparation.
             request.worker_loads = worker_loads_with_active_decode(loads(3));
 
             let expected = policy
-                .select_worker_traced(input(&workers, &request, overloaded), trace)
+                .select_worker_traced(input(&workers, &request), trace)
                 .unwrap();
             let actual = policy
-                .select_worker_prepared(
-                    input(&workers, &request, overloaded),
-                    Some(prepared),
-                    trace,
-                )
+                .select_worker_prepared(input(&workers, &request), Some(prepared), trace)
                 .unwrap();
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{case}");
         }

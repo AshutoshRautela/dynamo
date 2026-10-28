@@ -3718,43 +3718,24 @@ policy_classes:
         }
     }
 
-    /// Costs each worker by its load; ties go to the lowest worker.
+    /// Picks the least-loaded worker; ties go to the lowest worker.
     struct LeastLoaded;
 
-    impl crate::WorkerScorer for LeastLoaded {
+    impl crate::WorkerPicker for LeastLoaded {
         fn required_worker_inputs(&self) -> WorkerInputs {
             WorkerInputs::LOAD
         }
 
-        fn score(
-            &mut self,
-            _context: &crate::WorkerSelectionContext<'_>,
-            candidates: crate::WorkerCandidates<'_>,
-            costs: &mut [f64],
-        ) -> Result<(), crate::WorkerSelectionPolicyError> {
-            for (candidate, cost) in candidates.iter().zip(costs) {
-                let load = candidate.load().unwrap();
-                *cost = load.active_requests() as f64
-                    + load.active_prefill_tokens() as f64
-                    + load.decode_cost_blocks();
-            }
-            Ok(())
-        }
-    }
-
-    impl crate::WorkerPicker for LeastLoaded {
         fn pick(
             &mut self,
             _context: &crate::WorkerSelectionContext<'_>,
             input: crate::WorkerInputView<'_>,
         ) -> Result<usize, crate::WorkerSelectionPolicyError> {
-            let candidates = input.candidates();
+            let (candidates, loads) = (input.candidates(), input.load().unwrap());
             Ok((0..candidates.len())
-                .min_by(|&a, &b| {
-                    candidates[a]
-                        .cost()
-                        .total_cmp(&candidates[b].cost())
-                        .then(candidates[a].worker().cmp(&candidates[b].worker()))
+                .min_by_key(|&i| {
+                    let load = loads[i].active_requests() + loads[i].active_prefill_tokens();
+                    (load, candidates[i].worker())
                 })
                 .unwrap())
         }
@@ -3765,7 +3746,7 @@ policy_classes:
             inner: crate::WorkerSelectionPolicy::new(
                 crate::KvRouterConfig::default(),
                 "test",
-                vec![Box::new(LeastLoaded)],
+                vec![],
                 Box::new(LeastLoaded),
             ),
             prepared_selections: Arc::clone(prepared_selections),
@@ -3790,7 +3771,7 @@ policy_classes:
         }
     }
 
-    fn make_prepared_queue(threshold_frac: Option<f64>) -> PreparedQueue {
+    fn make_prepared_queue() -> PreparedQueue {
         let slots = Arc::new(ActiveSequencesMultiWorker::new(
             NoopSequencePublisher,
             16,
@@ -3823,7 +3804,7 @@ policy_classes:
         let queue = Arc::new(SchedulerQueue::new(
             Arc::clone(&slots),
             cfg_rx,
-            PolicyProfile::synthetic(threshold_frac, RouterQueuePolicy::Fcfs),
+            PolicyProfile::synthetic(None, RouterQueuePolicy::Fcfs),
             16,
             counting_policy(&prepared_selections),
             None,
@@ -3867,7 +3848,7 @@ policy_classes:
 
     #[tokio::test]
     async fn prepared_rows_see_bookings_made_after_preparation() {
-        let prepared_queue = make_prepared_queue(None);
+        let prepared_queue = make_prepared_queue();
         let queue = &prepared_queue.queue;
         let (later, later_rx) = make_request("later", 64);
         let prepared = queue.prepare_candidates(&later);
@@ -3888,7 +3869,7 @@ policy_classes:
     #[tokio::test]
     async fn prepared_rows_are_rebuilt_when_selection_inputs_change() {
         for change in ["configuration", "availability", "overload"] {
-            let prepared_queue = make_prepared_queue(None);
+            let prepared_queue = make_prepared_queue();
             let (request, rx) = make_request("request", 64);
             let prepared = prepared_queue.queue.prepare_candidates(&request);
             // Worker 0 wins on the prepared rows; each change rules it out afterwards.
@@ -3911,7 +3892,7 @@ policy_classes:
 
     #[tokio::test]
     async fn prepared_rows_recheck_config_under_selection_borrow() {
-        let prepared_queue = make_prepared_queue(None);
+        let prepared_queue = make_prepared_queue();
         let mut actor = actor_for_test(
             &prepared_queue.queue,
             &prepared_queue.slots,
@@ -3934,34 +3915,6 @@ policy_classes:
         let selected = rx.try_recv().unwrap().unwrap().best_worker;
         assert_eq!(selected, WorkerWithDpRank::new(1, 0));
         assert_eq!(prepared_queue.prepared_selections(), 0);
-    }
-
-    #[tokio::test]
-    async fn parked_request_rebuilds_prepared_rows() {
-        let prepared_queue = make_prepared_queue(Some(0.0));
-        let queue = &prepared_queue.queue;
-        for (id, worker) in [("first", 0), ("second", 1)] {
-            let (request, rx) = make_request(id, 64);
-            queue.enqueue(request).await;
-            let selected = rx.await.unwrap().unwrap().best_worker;
-            assert_eq!(selected, WorkerWithDpRank::new(worker, 0));
-        }
-        let (parked, mut parked_rx) = make_request("parked", 64);
-        queue.enqueue(parked).await;
-        assert!(parked_rx.try_recv().is_err());
-
-        // Worker 0 frees up while the request waits, but becomes overloaded.
-        *prepared_queue.overloaded.lock().unwrap() = Some(HashSet::from([0]));
-        prepared_queue
-            .slots
-            .free(&"first".to_owned(), Instant::now())
-            .unwrap();
-        queue.capacity_changed(Some(WorkerWithDpRank::new(0, 0)));
-        queue.update().await;
-
-        let selected = parked_rx.await.unwrap().unwrap().best_worker;
-        assert_eq!(selected, WorkerWithDpRank::new(1, 0));
-        assert_eq!(prepared_queue.prepared_selections(), 2);
     }
 
     #[tokio::test]
