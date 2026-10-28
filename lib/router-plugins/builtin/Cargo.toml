@@ -36,7 +36,3 @@ harness = false
 [[bench]]
 name = "default_lifecycle"
 harness = false
-
-[[bench]]
-name = "default_concurrent"
-harness = false
