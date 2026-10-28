@@ -9880,14 +9880,17 @@ spec:
                                   description: |-
                                     Path names one trace file relative to the root of the claim. It is neither a directory
                                     nor a glob. It must not start or end with '/' and must not contain empty, '.' or '..'
-                                    segments. The file must be complete before the Request is created and must never be
-                                    rewritten: every Run of the Request reads it when its Job starts.
+                                    segments or a NUL character, which no file name can hold. The file must be complete before
+                                    the Request is created and must never be rewritten: every Run of the Request reads it when
+                                    its Job starts.
                                   maxLength: 1024
                                   minLength: 1
                                   type: string
                                   x-kubernetes-validations:
                                     - message: path must be relative to the claim root without empty, '.' or '..' segments
                                       rule: '!self.startsWith(''/'') && !self.endsWith(''/'') && !self.contains(''//'') && !self.matches(''(^|/)[.][.]?(/|$)'')'
+                                    - message: path must not contain a NUL character
+                                      rule: '!self.contains(''\u0000'')'
                               required:
                                 - claimName
                                 - path

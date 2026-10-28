@@ -1120,6 +1120,15 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 			wantCELErr:   `spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
 		},
 		{
+			name: "v1beta2 trace path with a NUL character is rejected by CEL",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("retune/w\x00.jsonl")}
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantCELErr:   `spec.workload.trace.source.pvc.path: Invalid value: "string": path must not contain a NUL character`,
+		},
+		{
 			name: "v1beta2 trace claim name must be a DNS subdomain",
 			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
 				trace := v1beta2TraceForAdmission("w.jsonl")
@@ -1357,6 +1366,11 @@ func TestDynamoGraphDeploymentRunTraceIsValidatedByTheCRD(t *testing.T) {
 			name:       "a path that leaves the claim is rejected",
 			tracePath:  "../w.jsonl",
 			wantCELErr: `spec.workload.trace.source.pvc.path: Invalid value: "string": path must be relative to the claim root without empty, '.' or '..' segments`,
+		},
+		{
+			name:       "a path with a NUL character is rejected",
+			tracePath:  "retune/w\x00.jsonl",
+			wantCELErr: `spec.workload.trace.source.pvc.path: Invalid value: "string": path must not contain a NUL character`,
 		},
 		{
 			name:       "static beside a trace is rejected",

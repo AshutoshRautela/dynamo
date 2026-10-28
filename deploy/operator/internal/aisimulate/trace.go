@@ -75,7 +75,7 @@ func ValidateTraceWorkload(workload *v1beta2.WorkloadSpec, fldPath *field.Path) 
 			[]v1beta2.TraceFormat{v1beta2.TraceFormatDynamo}))
 	}
 
-	// The claim is a PersistentVolumeClaim name and the path one file that stays inside it.
+	// The claim is a PersistentVolumeClaim name and the path one nameable file that stays inside it.
 	pvcPath := tracePath.Child("source", "pvc")
 	if pvc := trace.Source.PVC; pvc == nil {
 		allErrs = append(allErrs, field.Required(pvcPath, "pvc is required"))
@@ -86,6 +86,9 @@ func ValidateTraceWorkload(workload *v1beta2.WorkloadSpec, fldPath *field.Path) 
 		if !validTraceClaimPath(pvc.Path) {
 			allErrs = append(allErrs, field.Invalid(pvcPath.Child("path"), pvc.Path,
 				"path must be relative to the claim root without empty, '.' or '..' segments"))
+		}
+		if strings.ContainsRune(pvc.Path, 0) {
+			allErrs = append(allErrs, field.Invalid(pvcPath.Child("path"), pvc.Path, "path must not contain a NUL character"))
 		}
 	}
 

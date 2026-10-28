@@ -5479,7 +5479,7 @@ ClaimName is the PersistentVolumeClaim, in the Request namespace, that holds the
 </ParamField>
 
 <ParamField path="path" type="string">
-Path names one trace file relative to the root of the claim. It is neither a directory nor a glob. It must not start or end with '/' and must not contain empty, '.' or '..' segments. The file must be complete before the Request is created and must never be rewritten: every Run of the Request reads it when its Job starts.
+Path names one trace file relative to the root of the claim. It is neither a directory nor a glob. It must not start or end with '/' and must not contain empty, '.' or '..' segments or a NUL character, which no file name can hold. The file must be complete before the Request is created and must never be rewritten: every Run of the Request reads it when its Job starts.
 **Validation:** MaxLength: 1024  MinLength: 1
 </ParamField>
 </Accordion>

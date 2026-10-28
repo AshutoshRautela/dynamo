@@ -114,6 +114,9 @@ func TestValidateTraceWorkload(t *testing.T) {
 		{name: "a claim name that is not a DNS subdomain", mutate: func(w *v1beta2.WorkloadSpec) {
 			w.Trace.Source.PVC.ClaimName = "Traces_1"
 		}, want: []string{`spec.workload.trace.source.pvc.claimName: Invalid value: "Traces_1": a lowercase RFC 1123 subdomain`}},
+		{name: "a path with a NUL character", mutate: func(w *v1beta2.WorkloadSpec) {
+			w.Trace.Source.PVC.Path = "retune/w\x00.jsonl"
+		}, want: []string{`spec.workload.trace.source.pvc.path: Invalid value: "retune/w\x00.jsonl": path must not contain a NUL character`}},
 		{name: "a non-positive speedup", mutate: func(w *v1beta2.WorkloadSpec) {
 			w.Trace.Replay.ArrivalSpeedupRatio = new(0.0)
 		}, want: []string{"spec.workload.trace.replay.arrivalSpeedupRatio: Invalid value: 0: must be greater than 0"}},

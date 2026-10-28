@@ -3923,7 +3923,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `claimName` _string_ | ClaimName is the PersistentVolumeClaim, in the Request namespace, that holds the trace.<br />The Run Job mounts it read-only, and only into the AISimulate container. |  | MaxLength: 253 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` <br /> |
-| `path` _string_ | Path names one trace file relative to the root of the claim. It is neither a directory<br />nor a glob. It must not start or end with '/' and must not contain empty, '.' or '..'<br />segments. The file must be complete before the Request is created and must never be<br />rewritten: every Run of the Request reads it when its Job starts. |  | MaxLength: 1024 <br />MinLength: 1 <br /> |
+| `path` _string_ | Path names one trace file relative to the root of the claim. It is neither a directory<br />nor a glob. It must not start or end with '/' and must not contain empty, '.' or '..'<br />segments or a NUL character, which no file name can hold. The file must be complete before<br />the Request is created and must never be rewritten: every Run of the Request reads it when<br />its Job starts. |  | MaxLength: 1024 <br />MinLength: 1 <br /> |
 
 
 #### TraceReplaySpec

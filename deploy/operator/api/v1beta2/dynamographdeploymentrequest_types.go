@@ -155,11 +155,13 @@ type TracePVCSource struct {
 
 	// Path names one trace file relative to the root of the claim. It is neither a directory
 	// nor a glob. It must not start or end with '/' and must not contain empty, '.' or '..'
-	// segments. The file must be complete before the Request is created and must never be
-	// rewritten: every Run of the Request reads it when its Job starts.
+	// segments or a NUL character, which no file name can hold. The file must be complete before
+	// the Request is created and must never be rewritten: every Run of the Request reads it when
+	// its Job starts.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=1024
 	// +kubebuilder:validation:XValidation:rule="!self.startsWith('/') && !self.endsWith('/') && !self.contains('//') && !self.matches('(^|/)[.][.]?(/|$)')",message="path must be relative to the claim root without empty, '.' or '..' segments"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('\\u0000')",message="path must not contain a NUL character"
 	Path string `json:"path"`
 }
 
