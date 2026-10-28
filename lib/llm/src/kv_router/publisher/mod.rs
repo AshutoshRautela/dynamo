@@ -94,7 +94,7 @@ pub enum KvEventSourceConfig {
 enum KvEventSource {
     Zmq {
         listener_abort_handle: tokio::task::AbortHandle,
-        supervisor_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<bool>>>,
+        supervisor_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<bool>>>,
     },
 }
 
@@ -188,7 +188,7 @@ impl KvEventSource {
 
                 Ok(KvEventSource::Zmq {
                     listener_abort_handle,
-                    supervisor_handle: tokio::sync::Mutex::new(Some(supervisor_handle)),
+                    supervisor_handle: parking_lot::Mutex::new(Some(supervisor_handle)),
                 })
             }
         }
@@ -211,7 +211,8 @@ impl KvEventSource {
             Self::Zmq {
                 supervisor_handle, ..
             } => {
-                if let Some(handle) = supervisor_handle.lock().await.take() {
+                let handle = supervisor_handle.lock().take();
+                if let Some(handle) = handle {
                     handle.await?;
                 }
             }
@@ -223,10 +224,8 @@ impl KvEventSource {
 #[derive(Debug)]
 pub(super) enum PublisherInput {
     Events(Vec<PlacementEvent>),
-    Recovery(
-        Vec<PlacementEvent>,
-        tokio::sync::oneshot::Sender<anyhow::Result<()>>,
-    ),
+    /// Replies once the processor and local index have finished every earlier input.
+    Barrier(tokio::sync::oneshot::Sender<anyhow::Result<()>>),
 }
 
 impl From<Vec<PlacementEvent>> for PublisherInput {
@@ -239,7 +238,7 @@ impl PublisherInput {
     fn into_events(self) -> Vec<PlacementEvent> {
         match self {
             Self::Events(events) => events,
-            Self::Recovery(..) => unreachable!("event send returned a recovery batch"),
+            Self::Barrier(..) => unreachable!("event send returned a barrier"),
         }
     }
 }
@@ -268,7 +267,7 @@ pub struct KvEventPublisher {
     /// Local pipeline initialization, independent of remote source activity.
     startup: Option<oneshot::Receiver<()>>,
     /// Locked only because `stop_and_wait` runs through shared `Arc` handles.
-    processor_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    processor_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl KvEventPublisher {
@@ -395,6 +394,17 @@ impl KvEventPublisher {
 
         let next_event_id = Arc::new(AtomicU64::new(0));
 
+        anyhow::ensure!(
+            enable_local_indexer
+                || !matches!(
+                    &source_config,
+                    Some(KvEventSourceConfig::Zmq {
+                        recovery: Some(_),
+                        ..
+                    })
+                ),
+            "KV replay recovery requires the local indexer"
+        );
         let mut source = None;
         if let Some(config) = source_config {
             source = Some(KvEventSource::start(
@@ -546,7 +556,7 @@ impl KvEventPublisher {
             tx,
             next_event_id,
             startup: Some(startup),
-            processor_handle: tokio::sync::Mutex::new(Some(processor_handle)),
+            processor_handle: parking_lot::Mutex::new(Some(processor_handle)),
         })
     }
 
@@ -717,7 +727,8 @@ impl KvEventPublisher {
         if let Some(source) = &self.source {
             source.stop_and_wait().await?;
         }
-        if let Some(handle) = self.processor_handle.lock().await.take() {
+        let handle = self.processor_handle.lock().take();
+        if let Some(handle) = handle {
             handle.await?;
         }
         Ok(())
