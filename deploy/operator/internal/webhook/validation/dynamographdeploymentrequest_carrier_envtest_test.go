@@ -91,7 +91,6 @@ func TestDynamoGraphDeploymentRequestCarrierTraceIsValidatedOnTheNextWrite(t *te
 	}
 }
 
-// setBeta2AdmissionTrace gives a v1beta2 Request hardware and a trace workload read from one claim file.
 func setBeta2AdmissionTrace(request *nvidiacomv1beta2.DynamoGraphDeploymentRequest) {
 	setBeta2AdmissionHardware(request)
 	request.Spec.Workload = &nvidiacomv1beta2.WorkloadSpec{Trace: &nvidiacomv1beta2.TraceWorkloadSpec{

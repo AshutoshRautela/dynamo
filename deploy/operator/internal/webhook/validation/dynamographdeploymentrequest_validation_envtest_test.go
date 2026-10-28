@@ -1189,6 +1189,21 @@ func TestDynamoGraphDeploymentRequestValidator_Validate(t *testing.T) {
 				"spec.aisimulate.inputOverrides.traffic.source.type: Forbidden: is owned by spec.workload.trace and cannot be overridden",
 			},
 		},
+		{
+			name: "v1beta2 a trace accepts no count stop override",
+			request: v1beta2DGDRForAdmission(func(spec map[string]any) {
+				spec["workload"] = map[string]any{"trace": v1beta2TraceForAdmission("w.jsonl")}
+				setV1beta2InputOverrides(spec, map[string]any{"traffic": map[string]any{
+					"stop": map[string]any{"requests_per_load_unit": 2.0, "sessions": 5},
+				}})
+			}, nil),
+			gpuDiscovery: true,
+			discovered:   discoveredH200,
+			wantWebhook: []string{
+				"spec.aisimulate.inputOverrides.traffic.stop.requests_per_load_unit: Forbidden: a trace replays every recorded request; only max_virtual_time_seconds can stop it",
+				"spec.aisimulate.inputOverrides.traffic.stop.sessions: Forbidden: a trace replays every recorded request; only max_virtual_time_seconds can stop it",
+			},
+		},
 		// v1beta2 UPDATE: defaults stay idempotent, hardware is never rediscovered, and any
 		// spec change is fully validated.
 		{
@@ -1612,7 +1627,6 @@ func v1beta2DGDRForAdmission(mutate func(spec map[string]any), labels map[string
 	}}
 }
 
-// v1beta2TraceForAdmission is an unstructured dynamo trace read from one file of request-traces.
 func v1beta2TraceForAdmission(path string) map[string]any {
 	return map[string]any{
 		"format": "dynamo",

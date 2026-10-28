@@ -1114,8 +1114,10 @@ The operator lowers the trace to the AISimulate input `traffic.source` (`type: t
 `arrivalSpeedupRatio` is set. It adds no `traffic.stop.requests`. When `trace` is set,
 `spec.aisimulate.inputOverrides` cannot set `traffic.source.type`, `traffic.source.format`, or
 `traffic.source.paths`, or replace `traffic` or `traffic.source` with a non-object value. Admission
-rejects these overrides, and the Run controller restores the typed values. Overrides of
-`traffic.load` and `traffic.stop.max_virtual_time_seconds` still apply.
+rejects these overrides, and the Run controller restores the typed values. A trace replays every
+recorded request, so admission also rejects the `traffic.stop` counts `requests`,
+`requests_per_load_unit`, `sessions`, and `sessions_per_load_unit`. Overrides of `traffic.load` and
+`traffic.stop.max_virtual_time_seconds` still apply.
 
 If the claim does not exist, is being deleted, is a block volume, allows only `ReadWriteOncePod`, or
 has lost its volume, the Run fails before its Job is created, and its `Completed` condition has

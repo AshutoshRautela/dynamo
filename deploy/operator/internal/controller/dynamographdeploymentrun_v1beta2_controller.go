@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -199,7 +200,6 @@ func (r *DynamoGraphDeploymentRunV1beta2Reconciler) ownedJobs(
 	return owned, nil
 }
 
-// dgdrRunReasonTraceSourceUnavailable completes a Run whose Job could never mount its trace claim.
 const dgdrRunReasonTraceSourceUnavailable = "TraceSourceUnavailable"
 
 // traceSourceUnavailable returns why a new Job could not mount the Run's trace claim, or "" when
@@ -522,13 +522,21 @@ func dgdrRunInput(
 	}
 
 	// The typed trace owns traffic.source.type, format and paths the same way. Restoring them keeps a
-	// Run created without Request admission reading only the file on its read-only mount.
+	// Run created without Request admission reading only the file on its read-only mount. Such a Run
+	// can also replace traffic or traffic.source with a non-object; that parent is rebuilt rather than
+	// failing every reconcile.
 	if run.Spec.Workload != nil && run.Spec.Workload.Trace != nil {
-		for key, value := range aisimulate.TraceSource(run.Spec.Workload.Trace) {
-			if err := unstructured.SetNestedField(input, value, "traffic", "source", key); err != nil {
-				return nil, fmt.Errorf("set workload-owned traffic.source.%s: %w", key, err)
-			}
+		traffic, ok := input["traffic"].(map[string]any)
+		if !ok {
+			traffic = map[string]any{}
+			input["traffic"] = traffic
 		}
+		source, ok := traffic["source"].(map[string]any)
+		if !ok {
+			source = map[string]any{}
+			traffic["source"] = source
+		}
+		maps.Copy(source, aisimulate.TraceSource(run.Spec.Workload.Trace))
 	}
 	return input, nil
 }

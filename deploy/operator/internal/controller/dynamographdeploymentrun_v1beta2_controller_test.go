@@ -795,6 +795,43 @@ func TestDGDRRunInputEnforcesTheTypedTraceSource(t *testing.T) {
 	}
 }
 
+func TestDGDRRunInputRebuildsANonObjectTraceSourceParent(t *testing.T) {
+	wantSource := map[string]any{"type": "trace", "format": "dynamo", "paths": []any{"/var/run/aisimulate/trace/retune/w-1.jsonl.gz"}}
+	tests := []struct {
+		name      string
+		overrides map[string]any
+		wantLoad  map[string]any
+	}{
+		{
+			name:      "scalar traffic",
+			overrides: map[string]any{"traffic": "invalid"},
+		},
+		{
+			name:      "scalar traffic.source",
+			overrides: map[string]any{"traffic": map[string]any{"source": "invalid"}},
+			wantLoad:  map[string]any{"type": "trace_timestamps"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Log("Lower a Run created without admission whose override replaces a trace source parent")
+			input, err := dgdrRunInput(dgdrRunWithTraceForTest(t, tt.overrides), "example.com/dynamo-planner:1.2.3", "1.2.3", 8)
+			if err != nil {
+				t.Fatalf("lower input: %v", err)
+			}
+
+			t.Log("The parent is an object again and carries the typed trace source")
+			traffic := input["traffic"].(map[string]any)
+			if !reflect.DeepEqual(traffic["source"], wantSource) {
+				t.Fatalf("traffic.source = %#v, want %#v", traffic["source"], wantSource)
+			}
+			if load, _ := traffic["load"].(map[string]any); !reflect.DeepEqual(load, tt.wantLoad) {
+				t.Fatalf("traffic.load = %#v, want %#v", traffic["load"], tt.wantLoad)
+			}
+		})
+	}
+}
+
 func TestV1beta2RunControllerFailsARunWhoseTraceClaimCannotBeMounted(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -901,8 +938,8 @@ func TestV1beta2RunControllerAcceptsAnUnboundOrSharedTraceClaim(t *testing.T) {
 		{name: "WaitForFirstConsumer claim still Pending", mutate: func(claim *corev1.PersistentVolumeClaim) {
 			claim.Status.Phase = corev1.ClaimPending
 		}},
-		{name: "ReadWriteOnce claim on the writer's node", mutate: func(claim *corev1.PersistentVolumeClaim) {
-			claim.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce, corev1.ReadWriteOncePod}
+		{name: "ReadWriteOnce claim", mutate: func(claim *corev1.PersistentVolumeClaim) {
+			claim.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
 		}},
 		{name: "claim without a volume mode", mutate: func(claim *corev1.PersistentVolumeClaim) {
 			claim.Spec.VolumeMode = nil

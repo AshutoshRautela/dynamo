@@ -25,7 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-// withTrace replaces the static workload with a dynamo trace read from one claim file.
 func withTrace(spec *v1beta2.DynamoGraphDeploymentRequestSpec, speedup *float64) *v1beta2.DynamoGraphDeploymentRequestSpec {
 	spec.Workload = &v1beta2.WorkloadSpec{Trace: &v1beta2.TraceWorkloadSpec{
 		Format: v1beta2.TraceFormatDynamo,

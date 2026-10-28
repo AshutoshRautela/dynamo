@@ -39,7 +39,7 @@ func validateAISimulateSpec(
 
 	allErrs := field.ErrorList{}
 	if workload != nil && workload.Trace != nil {
-		allErrs = validateTraceSourceOverrides(overrides, fldPath.Child("inputOverrides"))
+		allErrs = validateTraceOverrides(overrides, fldPath.Child("inputOverrides"))
 	}
 
 	dgdrRunValue, found := overrides["dgdr_run"]
@@ -77,10 +77,11 @@ func validateAISimulateSpec(
 	return allErrs
 }
 
-// validateTraceSourceOverrides rejects overrides of the traffic.source fields that
-// spec.workload.trace owns: type, format and paths. A traffic or traffic.source value that is
-// not an object would delete them, so it is rejected too. Load and stop overrides stay allowed.
-func validateTraceSourceOverrides(overrides map[string]any, fldPath *field.Path) field.ErrorList {
+// validateTraceOverrides rejects the traffic overrides a trace workload cannot take. The trace owns
+// traffic.source.type, format and paths, and a traffic or traffic.source value that is not an
+// object would delete them. A trace replays every recorded request, so AISimulate accepts no
+// request or session count in traffic.stop. Other load and stop overrides stay allowed.
+func validateTraceOverrides(overrides map[string]any, fldPath *field.Path) field.ErrorList {
 	const owned = "is owned by spec.workload.trace and cannot be overridden"
 	traffic, found := overrides["traffic"]
 	if !found {
@@ -91,19 +92,27 @@ func validateTraceSourceOverrides(overrides map[string]any, fldPath *field.Path)
 		return field.ErrorList{field.Forbidden(fldPath.Child("traffic"),
 			"must be an object because spec.workload.trace owns traffic.source")}
 	}
-	source, found := trafficObject["source"]
-	if !found {
-		return nil
-	}
-	sourceObject, ok := source.(map[string]any)
-	if !ok {
-		return field.ErrorList{field.Forbidden(fldPath.Child("traffic", "source"), owned)}
+
+	// The source fields the trace owns, or a source that is not an object.
+	allErrs := field.ErrorList{}
+	if source, found := trafficObject["source"]; found {
+		sourceObject, ok := source.(map[string]any)
+		if !ok {
+			return field.ErrorList{field.Forbidden(fldPath.Child("traffic", "source"), owned)}
+		}
+		for _, key := range []string{"format", "paths", "type"} {
+			if _, found := sourceObject[key]; found {
+				allErrs = append(allErrs, field.Forbidden(fldPath.Child("traffic", "source", key), owned))
+			}
+		}
 	}
 
-	allErrs := field.ErrorList{}
-	for _, key := range []string{"format", "paths", "type"} {
-		if _, found := sourceObject[key]; found {
-			allErrs = append(allErrs, field.Forbidden(fldPath.Child("traffic", "source", key), owned))
+	// The count stops that AISimulate rejects for trace traffic; null only deletes an absent count.
+	stop, _ := trafficObject["stop"].(map[string]any)
+	for _, key := range []string{"requests", "requests_per_load_unit", "sessions", "sessions_per_load_unit"} {
+		if value, found := stop[key]; found && value != nil {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Child("traffic", "stop", key),
+				"a trace replays every recorded request; only max_virtual_time_seconds can stop it"))
 		}
 	}
 	return allErrs
