@@ -101,8 +101,6 @@ func setBeta2AdmissionTrace(request *nvidiacomv1beta2.DynamoGraphDeploymentReque
 	}}
 }
 
-// carrierRoundTrip writes a request through its owning version and through the other version, and
-// returns the other version's first view of it.
 func carrierRoundTrip(t *testing.T, ownerFixture, otherFixture runtime.Object, carrierKey string) *unstructured.Unstructured {
 	t.Helper()
 	env := admissionEnv.ForTest(t)
