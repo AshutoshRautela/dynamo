@@ -43,8 +43,8 @@ use crate::protocols::{
     WorkerId, WorkerSelectionResult, WorkerWithDpRank,
 };
 use crate::sequences::{
-    ActiveSequencesMultiWorker, SequenceError, SequencePublisher, SequenceRequest,
-    WorkerLoadProjection,
+    ActiveSequencesMultiWorker, ActiveTokensReader, SequenceError, SequencePublisher,
+    SequenceRequest, WorkerLoadProjection,
 };
 
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)
@@ -1434,10 +1434,9 @@ impl<
                 .and_then(|provider| provider(&request));
             let should_queue = class.queueing_enabled()
                 && (self.pending.has_backlog(class_index) || {
-                    let active_tokens = self.slots.active_tokens(decay_now);
                     let configs = self.workers_with_configs.borrow();
                     Self::all_workers_prefill_busy_with(
-                        &active_tokens,
+                        &self.slots.active_tokens_reader(decay_now),
                         &configs,
                         class,
                         request
@@ -1611,20 +1610,17 @@ impl<
 
     fn has_dispatchable_ready_head(&self) -> bool {
         let decay_now = Instant::now();
-        let mut active_tokens = None;
         self.pending.any_ready_head(|_, class, queued| {
             if !class.queueing_enabled() {
                 return true;
             }
-            let active_tokens =
-                active_tokens.get_or_insert_with(|| self.slots.active_tokens(decay_now));
             let available = self
                 .available_worker_provider
                 .as_ref()
                 .and_then(|provider| provider(&queued.request));
             let configs = self.workers_with_configs.borrow();
             !Self::all_workers_prefill_busy_with(
-                active_tokens,
+                &self.slots.active_tokens_reader(decay_now),
                 &configs,
                 class,
                 queued
@@ -1706,9 +1702,12 @@ impl<
                 break;
             }
             let decay_now = Instant::now();
-            // Share a capacity snapshot within this pass only. The next admission
-            // must observe the capacity reserved by the previous one.
-            let mut active_tokens = None;
+            // Each pass reads worker load after the previous admission booked, so
+            // the next admission observes the capacity that admission reserved.
+            // Loads are read per head and per worker, and the gate stops at the
+            // first worker that is not busy. A free or peer booking from another
+            // task can land between two reads in one pass; the gate already
+            // tolerates those races, since they can also land right after it.
             let popped = {
                 let slots = &self.slots;
                 let provider = self.available_worker_provider.as_ref();
@@ -1717,15 +1716,13 @@ impl<
                     if !class.queueing_enabled() {
                         return true;
                     }
-                    let active_tokens =
-                        active_tokens.get_or_insert_with(|| slots.active_tokens(decay_now));
                     let available = provider.and_then(|provider| provider(&queued.request));
                     let configs = workers.borrow();
                     // TODO: This preserves head-of-line blocking within each policy
                     // class. A blocked constrained head can stall later entries in
                     // that class until a bounded non-HOL policy is introduced.
                     !Self::all_workers_prefill_busy_with(
-                        active_tokens,
+                        &slots.active_tokens_reader(decay_now),
                         &configs,
                         class,
                         queued
@@ -2170,7 +2167,7 @@ impl<
     }
 
     fn all_workers_prefill_busy_with(
-        active_tokens: &HashMap<crate::protocols::WorkerWithDpRank, usize>,
+        active_tokens: &ActiveTokensReader<'_>,
         configs: &HashMap<WorkerId, C>,
         class: &PolicyClassConfig,
         eligibility: RoutingEligibility<'_>,
@@ -2183,7 +2180,7 @@ impl<
             let max_batched = config
                 .max_num_batched_tokens()
                 .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
-            let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
+            let tokens = active_tokens.get(worker);
             return class.worker_is_busy(tokens, max_batched);
         }
 
@@ -2193,7 +2190,7 @@ impl<
             let max_batched = config
                 .max_num_batched_tokens()
                 .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
-            let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
+            let tokens = active_tokens.get(worker);
             !class.worker_is_busy(tokens, max_batched)
         });
 

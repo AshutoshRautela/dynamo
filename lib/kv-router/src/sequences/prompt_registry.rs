@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crossbeam_utils::sync::ShardedLockReadGuard;
 use dynamo_tokens::SequenceHash;
 use indexmap::IndexMap;
 #[cfg(test)]
@@ -134,6 +135,10 @@ impl WorkerLoadTable {
             .map(|(&worker, slot)| (worker, slot.snapshot()))
     }
 
+    fn get(&self, worker: WorkerWithDpRank) -> Option<WorkerLoadSnapshot> {
+        self.entries.get(&worker).map(WorkerLoadSlot::snapshot)
+    }
+
     fn ensure_worker(&mut self, worker: WorkerWithDpRank) {
         self.entries
             .entry(worker)
@@ -158,6 +163,25 @@ impl WorkerLoadTable {
 
     fn remove(&mut self, worker: WorkerWithDpRank) {
         self.entries.swap_remove(&worker);
+    }
+}
+
+/// Per-worker active prefill tokens at one decay instant, read on demand.
+///
+/// Holds the load table's read lock, so workers are not added or removed while
+/// it is alive. Each lookup copies that worker's latest load, so load updates
+/// from other tasks can land between two lookups.
+pub(crate) struct ActiveTokensReader<'a> {
+    loads: ShardedLockReadGuard<'a, WorkerLoadTable>,
+    decay_now: Instant,
+}
+
+impl ActiveTokensReader<'_> {
+    /// Active prefill tokens of `worker`, or 0 for an unknown worker.
+    pub(crate) fn get(&self, worker: WorkerWithDpRank) -> usize {
+        self.loads
+            .get(worker)
+            .map_or(0, |load| load.active_tokens(self.decay_now))
     }
 }
 
@@ -366,6 +390,13 @@ impl PromptRegistry {
             .iter()
             .map(|(worker, load)| (worker, load.active_tokens(decay_now)))
             .collect()
+    }
+
+    pub(super) fn active_tokens_reader(&self, decay_now: Instant) -> ActiveTokensReader<'_> {
+        ActiveTokensReader {
+            loads: self.loads.read(),
+            decay_now,
+        }
     }
 
     pub(super) fn modeled_remaining_prefill_times_ms(
@@ -601,6 +632,7 @@ mod tests {
 
         registry.assert_consistent_with_workers(&expected_loads, &expected_blocks);
         assert_eq!(registry.active_tokens(now).get(&worker).copied(), Some(9));
+        assert_eq!(registry.active_tokens_reader(now).get(worker), 9);
 
         let actual = registry.potential_blocks_and_tokens::<false>(
             Some(&[1, 2, 3]),

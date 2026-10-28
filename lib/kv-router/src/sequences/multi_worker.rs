@@ -24,7 +24,7 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::prefill_tracker::PrefillTimeLoad;
-use super::prompt_registry::{PromptRegistry, WorkerLoadSnapshot};
+use super::prompt_registry::{ActiveTokensReader, PromptRegistry, WorkerLoadSnapshot};
 use super::request_maps::{RequestBooking, RequestIndex};
 use super::sharded_lock::ShardedRwLock;
 use super::single::{
@@ -1340,6 +1340,11 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
     /// Query all workers for their current number of active tokens.
     pub fn active_tokens(&self, decay_now: Instant) -> HashMap<WorkerWithDpRank, usize> {
         self.prompt_registry.active_tokens(decay_now)
+    }
+
+    /// Read workers' active tokens one at a time, without building a map of every worker.
+    pub(crate) fn active_tokens_reader(&self, decay_now: Instant) -> ActiveTokensReader<'_> {
+        self.prompt_registry.active_tokens_reader(decay_now)
     }
 
     /// Return modeled remaining prefill time by worker from the derived read model.
